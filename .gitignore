@@ -9,3 +9,7 @@ pretrained/
 concorde/
 
 api.txt
+.agents
+.uv-cache
+.gitignore
+uv.lock

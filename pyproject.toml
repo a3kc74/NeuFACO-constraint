@@ -1,0 +1,40 @@
+﻿[project]
+name = "neufaco-constraint"
+version = "0.1.0"
+description = "NeuFACO constraint experiments for CVRPTW."
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "numpy==1.23.5",
+    "numba==0.58.1",
+    "pandas==2.0.3",
+    "pyvrp==0.8.2",
+    "scipy==1.10.1",
+    "tqdm==4.66.1",
+    "wandb==0.28.0",
+]
+
+[project.optional-dependencies]
+cuda = [
+    "torch==2.1.1+cu121",
+    "torch_geometric==2.4.0",
+]
+
+[tool.uv]
+package = false
+environments = [
+    "sys_platform == 'win32'",
+]
+exclude-dependencies = [
+    "triton",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu121", extra = "cuda" },
+]
