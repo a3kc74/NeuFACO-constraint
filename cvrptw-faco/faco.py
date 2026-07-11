@@ -35,7 +35,9 @@ except ImportError:
     except ImportError:
         # Check if it is in src but import failed
         raise ImportError(
-            "C++ backend 'faco_opt' not found. Please build the C++ extension in src/."
+            "C++ backend 'faco_opt' not found. Please build the C++ extension: "
+            "cd cvrptw-faco/src && uv run python setup.py build_ext --inplace. "
+            "On Windows, install Microsoft C++ Build Tools first if compilation fails."
         )
 
 def set_faco_cpp_threads(n_threads: int) -> None:

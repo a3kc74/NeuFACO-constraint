@@ -1,10 +1,12 @@
 from setuptools import setup, Extension
 import pybind11
-import os
 import sys
 
 # Platform specific flags
-if sys.platform == "darwin":
+if sys.platform == "win32":
+    extra_compile_args = ["/O2", "/std:c++17", "/openmp"]
+    extra_link_args = []
+elif sys.platform == "darwin":
     # MacOS usually uses clang which might need different openmp flags
     # But user is on Linux, so we focus on GCC/Clang with -fopenmp
     extra_compile_args = ['-O3', '-std=c++17', '-Xpreprocessor', '-fopenmp']
