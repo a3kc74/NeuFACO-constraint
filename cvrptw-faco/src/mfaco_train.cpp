@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <string>
 
 #include <omp.h>
 #include <stdexcept>
@@ -375,8 +376,7 @@ void MFACO_TSP::build_nn_lists() {
   // NOTE: use exact distances (no rounding) for neighbor selection.
   KDTree shared_kdtree(pts, /*round_distances=*/false);
 
-#pragma omp parallel default(none) shared(shared_kdtree, nn_list, backup_list) \
-    firstprivate(n, k, bl, total)
+#pragma omp parallel default(none) shared(shared_kdtree) firstprivate(total)
   {
     KDTree kdtree = shared_kdtree; // private copy (supports delete/undelete)
 
@@ -1430,8 +1430,7 @@ void MFACO_CVRP::build_nn_lists() {
 
   KDTree shared_kdtree(pts, /*round_distances=*/false);
 
-#pragma omp parallel default(none) shared(shared_kdtree, nn_list, backup_list) \
-    firstprivate(n, k, bl, total)
+#pragma omp parallel default(none) shared(shared_kdtree) firstprivate(total)
   {
     KDTree kdtree = shared_kdtree;
     std::vector<int32_t> deleted_nodes;
