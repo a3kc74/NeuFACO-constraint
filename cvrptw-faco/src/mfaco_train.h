@@ -513,6 +513,9 @@ public:
   std::vector<float> demand;       // (n,) demand[0]=0
   std::vector<int64_t> demand_int; // (n,) scaled/rounded
   std::vector<float> d0;           // (n,) dist to depot (precomputed)
+  bool has_time_windows = false;
+  std::vector<float> ready_time; // (n,)
+  std::vector<float> due_time;   // (n,)
 
   std::vector<int32_t> nn_list;     // (n,k)
   std::vector<int32_t> backup_list; // (n,bl)
@@ -551,6 +554,8 @@ public:
              bool nls_ = false, int32_t T_nls_ = 10);
 
   void seed_rng(uint64_t seed);
+
+  void set_time_windows(const float *windows_ptr);
 
   void sample(bool require_prob, const float *prior_ptr, SampleResult &result,
               bool parallel_traced);
@@ -592,6 +597,10 @@ private:
   void build_d0();
   void build_initial_perm();
   void build_initial_solution();
+
+  bool route_time_feasible(const std::vector<int32_t> &route) const;
+  bool can_append_tw(int32_t prev, int32_t node, float route_time) const;
+  void enforce_time_windows(std::vector<int32_t> &route) const;
 
   // ---- probability mat on sparse graph (n,k) ----
   void compute_probmat(const float *prior_ptr, std::vector<float> &probmat);

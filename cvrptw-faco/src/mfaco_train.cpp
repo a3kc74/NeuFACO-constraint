@@ -1312,6 +1312,91 @@ MFACO_CVRP::MFACO_CVRP(const float *coords_ptr, const float *demand_ptr,
 
 void MFACO_CVRP::seed_rng(uint64_t seed) { rng_.seed(seed); }
 
+void MFACO_CVRP::set_time_windows(const float *windows_ptr) {
+  if (!windows_ptr) {
+    throw std::runtime_error("windows_ptr must not be null");
+  }
+  has_time_windows = true;
+  ready_time.resize(n);
+  due_time.resize(n);
+  for (int32_t i = 0; i < n; ++i) {
+    ready_time[i] = windows_ptr[i * 2];
+    due_time[i] = windows_ptr[i * 2 + 1];
+  }
+}
+
+bool MFACO_CVRP::can_append_tw(int32_t prev, int32_t node,
+                               float route_time) const {
+  if (!has_time_windows)
+    return true;
+  float arrival = route_time + dist(prev, node);
+  if (arrival > due_time[node] + 1e-6f)
+    return false;
+  float service_start = std::max(arrival, ready_time[node]);
+  return service_start + dist(node, 0) <= due_time[0] + 1e-6f;
+}
+
+bool MFACO_CVRP::route_time_feasible(const std::vector<int32_t> &route) const {
+  if (!has_time_windows)
+    return true;
+  float route_time = 0.0f;
+  int32_t prev = 0;
+  for (int32_t node : route) {
+    if (node == 0) {
+      if (prev != 0 && route_time + dist(prev, 0) > due_time[0] + 1e-6f)
+        return false;
+      route_time = 0.0f;
+      prev = 0;
+      continue;
+    }
+    float arrival = route_time + dist(prev, node);
+    if (arrival > due_time[node] + 1e-6f)
+      return false;
+    route_time = std::max(arrival, ready_time[node]);
+    if (route_time + dist(node, 0) > due_time[0] + 1e-6f)
+      return false;
+    prev = node;
+  }
+  return true;
+}
+
+void MFACO_CVRP::enforce_time_windows(std::vector<int32_t> &route) const {
+  if (!has_time_windows || route.empty())
+    return;
+
+  std::vector<int32_t> rebuilt;
+  rebuilt.reserve(route.size() + n);
+  rebuilt.push_back(0);
+
+  float route_time = 0.0f;
+  int64_t route_load = 0;
+  int32_t prev = 0;
+
+  for (int32_t node : route) {
+    if (node == 0)
+      continue;
+
+    bool feasible_here = can_append_tw(prev, node, route_time) &&
+                         route_load + demand_int[node] <= capacity_int;
+    if (!feasible_here && prev != 0) {
+      rebuilt.push_back(0);
+      route_time = 0.0f;
+      route_load = 0;
+      prev = 0;
+    }
+
+    float arrival = route_time + dist(prev, node);
+    rebuilt.push_back(node);
+    route_time = std::max(arrival, ready_time[node]);
+    route_load += demand_int[node];
+    prev = node;
+  }
+
+  if (rebuilt.back() != 0)
+    rebuilt.push_back(0);
+  route.swap(rebuilt);
+}
+
 void MFACO_CVRP::reset_timings() {
   time_ant = 0.0;
   time_ls = 0.0;
@@ -3872,6 +3957,11 @@ float MFACO_CVRP::sample_ant_direct(const float *probmat, int32_t start_node,
   if (!route_out.empty())
     route_out.push_back(0);
 
+  enforce_time_windows(route_out);
+  std::vector<int32_t> route_before_ls;
+  if (has_time_windows)
+    route_before_ls = route_out;
+
   // 6. Apply Local Search
   if (use_local_search && !checklist.empty()) {
     // Intra-Route LS (2-opt)
@@ -3882,6 +3972,9 @@ float MFACO_CVRP::sample_ant_direct(const float *probmat, int32_t start_node,
     // Intra-Route LS (2-opt)
     intra_route_ls(route_out, checklist);
   }
+
+  if (has_time_windows && !route_time_feasible(route_out))
+    route_out.swap(route_before_ls);
 
   // Calculate final cost
   float final_cost = 0.0f;
@@ -4375,6 +4468,8 @@ float MFACO_CVRP::sample_ant_direct_traced(
     route_out.push_back(0);
   }
 
+  enforce_time_windows(route_out);
+
   // Capture raw route before LS
   route_raw_out = route_out;
   cost_raw_out = 0.0f;
@@ -4384,6 +4479,9 @@ float MFACO_CVRP::sample_ant_direct_traced(
 
   // 6. Apply Local Search
   if (use_local_search && !checklist.empty()) {
+    std::vector<int32_t> route_before_ls;
+    if (has_time_windows)
+      route_before_ls = route_out;
     // Intra-Route LS (2-opt)
     intra_route_ls(route_out, checklist);
     // Inter-Route LS
@@ -4391,6 +4489,8 @@ float MFACO_CVRP::sample_ant_direct_traced(
     inter_route_ls_optimized(route_out, pos_ls, checklist, in_checklist);
     // Intra-Route LS (2-opt)
     intra_route_ls(route_out, checklist);
+    if (has_time_windows && !route_time_feasible(route_out))
+      route_out.swap(route_before_ls);
   }
 
   // Calculate final cost

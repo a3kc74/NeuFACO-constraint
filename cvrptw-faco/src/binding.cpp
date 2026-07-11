@@ -547,6 +547,32 @@ public:
   }
 };
 
+class PyMFACO_CVRPTW : public PyMFACO_CVRP {
+public:
+  PyMFACO_CVRPTW(
+      py::array_t<float, py::array::c_style | py::array::forcecast> coords,
+      py::array_t<float, py::array::c_style | py::array::forcecast> demand,
+      py::array_t<float, py::array::c_style | py::array::forcecast> windows,
+      float capacity, int32_t n_ants, int32_t cand_list_size = 32,
+      int32_t backup_list_size = 32, int32_t min_new_edges = 8,
+      float decay = 0.9f, float alpha = 1.0f, float p_best = 0.05f,
+      bool use_local_search = true, bool disable_heuristic = false,
+      bool extend_ls = false, bool smooth_mmas = false,
+      int32_t fixed_steps = 0, bool nls = false, int32_t T_nls = 10)
+      : PyMFACO_CVRP(coords, demand, capacity, n_ants, cand_list_size,
+                     backup_list_size, min_new_edges, decay, alpha, p_best,
+                     use_local_search, disable_heuristic, extend_ls,
+                     smooth_mmas, fixed_steps, nls, T_nls) {
+    auto cbuf = coords.request();
+    auto wbuf = windows.request();
+    if (wbuf.ndim != 2 || wbuf.shape[0] != cbuf.shape[0] ||
+        wbuf.shape[1] != 2) {
+      throw std::runtime_error("windows must be shape (n,2) matching coords");
+    }
+    solver->set_time_windows((const float *)wbuf.ptr);
+  }
+};
+
 // ============================================================================
 // ACO_TSP Python wrapper
 // ============================================================================
@@ -980,6 +1006,60 @@ PYBIND11_MODULE(faco_opt, m) {
           [](PyMFACO_CVRP &self, bool v) { self.solver->use_2opt_star = v; })
       .def("reset_timings", &PyMFACO_CVRP::reset_timings)
       .def("get_timings", &PyMFACO_CVRP::get_timings);
+
+  py::class_<PyMFACO_CVRPTW, PyMFACO_CVRP>(m, "MFACO_CVRPTW")
+      .def(py::init<
+               py::array_t<float, py::array::c_style | py::array::forcecast>,
+               py::array_t<float, py::array::c_style | py::array::forcecast>,
+               py::array_t<float, py::array::c_style | py::array::forcecast>,
+               float, int32_t, int32_t, int32_t, int32_t, float, float, float,
+               bool, bool, bool, bool, int32_t, bool, int32_t>(),
+           py::arg("coords"), py::arg("demand"), py::arg("windows"),
+           py::arg("capacity"), py::arg("n_ants"),
+           py::arg("cand_list_size") = 32, py::arg("backup_list_size") = 32,
+           py::arg("min_new_edges") = 8, py::arg("decay") = 0.9f,
+           py::arg("alpha") = 1.0f, py::arg("p_best") = 0.05f,
+           py::arg("use_local_search") = true,
+           py::arg("disable_heuristic") = false,
+           py::arg("extend_ls") = false, py::arg("smooth_mmas") = false,
+           py::arg("fixed_steps") = 0, py::arg("nls") = false,
+           py::arg("T_nls") = 10)
+      .def_property_readonly("n", &PyMFACO_CVRPTW::get_n)
+      .def_property_readonly("m", &PyMFACO_CVRPTW::get_m)
+      .def_property_readonly("n_ants", &PyMFACO_CVRPTW::get_n_ants)
+      .def_property_readonly("k", &PyMFACO_CVRPTW::get_k)
+      .def_property_readonly("bl", &PyMFACO_CVRPTW::get_bl)
+      .def_property_readonly("source_cost", &PyMFACO_CVRPTW::get_source_cost)
+      .def_property_readonly("best_cost", &PyMFACO_CVRPTW::get_best_cost)
+      .def_property_readonly("tau_min", &PyMFACO_CVRPTW::get_tau_min)
+      .def_property_readonly("tau_max", &PyMFACO_CVRPTW::get_tau_max)
+      .def_property_readonly("pheromone_sparse_np",
+                             &PyMFACO_CVRPTW::get_pheromone_sparse_np)
+      .def_property_readonly("nn_list", &PyMFACO_CVRPTW::get_nn_list)
+      .def_property_readonly("backup_list", &PyMFACO_CVRPTW::get_backup_list)
+      .def_property_readonly("heuristic_sparse_np",
+                             &PyMFACO_CVRPTW::get_heuristic_sparse_np)
+      .def_property_readonly("source_route", &PyMFACO_CVRPTW::get_source_route)
+      .def_property_readonly("best_route", &PyMFACO_CVRPTW::get_best_route)
+      .def("seed_rng", &PyMFACO_CVRPTW::seed_rng)
+      .def("sample", &PyMFACO_CVRPTW::sample, py::arg("require_prob") = false,
+           py::arg("prior") = py::none(), py::arg("parallel_traced") = false,
+           py::arg("return_decoded") = false)
+      .def("update_pheromone_from_route",
+           &PyMFACO_CVRPTW::update_pheromone_from_route)
+      .def_property(
+          "use_relocate",
+          [](PyMFACO_CVRPTW &self) { return self.solver->use_relocate; },
+          [](PyMFACO_CVRPTW &self, bool v) { self.solver->use_relocate = v; })
+      .def_property(
+          "use_swap", [](PyMFACO_CVRPTW &self) { return self.solver->use_swap; },
+          [](PyMFACO_CVRPTW &self, bool v) { self.solver->use_swap = v; })
+      .def_property(
+          "use_2opt_star",
+          [](PyMFACO_CVRPTW &self) { return self.solver->use_2opt_star; },
+          [](PyMFACO_CVRPTW &self, bool v) { self.solver->use_2opt_star = v; })
+      .def("reset_timings", &PyMFACO_CVRPTW::reset_timings)
+      .def("get_timings", &PyMFACO_CVRPTW::get_timings);
 
   // ACO_TSP
   py::class_<PyACO_TSP>(m, "ACO_TSP")

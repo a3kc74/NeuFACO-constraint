@@ -707,6 +707,88 @@ class MFACO_CVRP:
     def get_timings(self) -> dict:
         return self._cpp.get_timings()
 
+
+class MFACO_CVRPTW(MFACO_CVRP):
+    """
+    MFACO CVRPTW solver wrapping the C++ backend.
+
+    Matches cvrptw-gfacs in-memory semantics: coords/positions, normalized
+    demand, capacity, and windows[:, 0:2] = [ready_time, due_time]. Service
+    time is treated as zero and the objective is pure Euclidean travel cost.
+    """
+
+    def __init__(
+        self,
+        coords,
+        demand,
+        windows,
+        capacity: float,
+        n_ants: int,
+        cand_list_size: int = 32,
+        backup_list_size: int = 64,
+        min_new_edges: int = 8,
+        decay: float = 0.9,
+        alpha: float = 1.0,
+        p_best: float = 0.05,
+        use_local_search: bool = True,
+        disable_heuristic: bool = False,
+        extend_ls: bool = False,
+        smooth_mmas: bool = False,
+        device: str = "cpu",
+        enable_torch_sync: bool = True,
+        normalized_heuristic: bool = False,
+        fixed_steps: int = 0,
+        nls: bool = False,
+        T_nls: int = 10,
+        **kwargs
+    ):
+        coords_np = _as_numpy_f32(coords)
+        demand_np = _as_numpy_f32(demand)
+        windows_np = _as_numpy_f32(windows)
+        if coords_np.ndim != 2 or coords_np.shape[1] != 2:
+            raise ValueError(f"coords must have shape (n, 2), got {coords_np.shape}")
+        if demand_np.ndim != 1 or demand_np.shape[0] != coords_np.shape[0]:
+            raise ValueError("demand must be shape (n,) matching coords")
+        if windows_np.ndim != 2 or windows_np.shape != (coords_np.shape[0], 2):
+            raise ValueError(f"windows must have shape (n, 2), got {windows_np.shape}")
+        demand_np = demand_np.copy()
+        demand_np[0] = 0.0
+
+        self._cpp = faco_opt.MFACO_CVRPTW(
+            coords_np,
+            demand_np,
+            windows_np,
+            float(capacity),
+            int(n_ants),
+            int(cand_list_size),
+            int(backup_list_size),
+            int(min_new_edges),
+            float(decay),
+            float(alpha),
+            float(p_best),
+            bool(use_local_search),
+            bool(disable_heuristic),
+            bool(extend_ls),
+            bool(smooth_mmas),
+            int(fixed_steps),
+            bool(nls),
+            int(T_nls),
+        )
+        self.device = device
+        self._enable_torch_sync = enable_torch_sync
+        self.alpha = alpha
+        self.disable_heuristic = disable_heuristic
+
+        if normalized_heuristic and not disable_heuristic:
+            h = np.asarray(self._cpp.heuristic_sparse_np)
+            row_sums = h.sum(axis=1, keepdims=True)
+            h_norm = h / (row_sums + 1e-12)
+            np.copyto(h, h_norm)
+
+        self._pheromone_sparse = torch.from_numpy(self._cpp.pheromone_sparse_np.copy()).to(device)
+        self._h_sparse_torch = torch.from_numpy(self._cpp.heuristic_sparse_np.copy()).to(device)
+        self._nn_torch = torch.from_numpy(self._cpp.nn_list.copy()).to(device).long()
+
     def sync_pheromone_to_torch(self) -> None:
         phe_np = np.asarray(self._cpp.pheromone_sparse_np)
         self._pheromone_sparse.copy_(torch.from_numpy(phe_np).to(self.device))
