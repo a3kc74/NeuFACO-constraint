@@ -1323,6 +1323,14 @@ void MFACO_CVRP::set_time_windows(const float *windows_ptr) {
     ready_time[i] = windows_ptr[i * 2];
     due_time[i] = windows_ptr[i * 2 + 1];
   }
+
+  build_initial_solution();
+  auto [tmin, tmax] = smooth_mmas ? calc_trail_limits_smooth(source_cost)
+                                  : calc_trail_limits_cl(source_cost);
+  tau_min = tmin;
+  tau_max = tmax;
+  pheromone_sparse.assign(static_cast<size_t>(n) * static_cast<size_t>(k),
+                          tau_max);
 }
 
 bool MFACO_CVRP::can_append_tw(int32_t prev, int32_t node,
@@ -1356,6 +1364,103 @@ bool MFACO_CVRP::route_time_feasible(const std::vector<int32_t> &route) const {
     if (route_time + dist(node, 0) > due_time[0] + 1e-6f)
       return false;
     prev = node;
+  }
+  return true;
+}
+
+bool MFACO_CVRP::route_fully_feasible(const std::vector<int32_t> &route) const {
+  if (route.empty() || route.front() != 0 || route.back() != 0)
+    return false;
+
+  std::vector<uint8_t> seen(n, 0);
+  int32_t seen_count = 0;
+  int64_t route_load = 0;
+  float route_time = 0.0f;
+  int32_t prev = 0;
+
+  for (size_t i = 1; i < route.size(); ++i) {
+    int32_t node = route[i];
+    if (node < 0 || node >= n)
+      return false;
+
+    float arrival = route_time + dist(prev, node);
+    if (node == 0) {
+      if (prev != 0 && has_time_windows && arrival > due_time[0] + 1e-6f)
+        return false;
+      route_load = 0;
+      route_time = 0.0f;
+      prev = 0;
+      continue;
+    }
+
+    if (seen[node])
+      return false;
+    seen[node] = 1;
+    seen_count++;
+
+    route_load += demand_int[node];
+    if (route_load > capacity_int)
+      return false;
+
+    if (has_time_windows) {
+      if (arrival > due_time[node] + 1e-6f)
+        return false;
+      route_time = std::max(arrival, ready_time[node]);
+      if (route_time + dist(node, 0) > due_time[0] + 1e-6f)
+        return false;
+    } else {
+      route_time = arrival;
+    }
+    prev = node;
+  }
+
+  return seen_count == m;
+}
+
+bool MFACO_CVRP::linked_route_feasible(
+    int32_t route_id, const std::vector<int32_t> &next_node,
+    const std::vector<int32_t> &node_route,
+    const std::vector<int64_t> &route_loads) const {
+  if (route_id < 0 || route_id >= (int32_t)route_loads.size())
+    return false;
+  if (route_loads[route_id] > capacity_int)
+    return false;
+  if (!has_time_windows)
+    return true;
+
+  int32_t depot = n + route_id;
+  if (depot < 0 || depot >= (int32_t)next_node.size())
+    return false;
+
+  float route_time = 0.0f;
+  int32_t prev = 0;
+  int32_t w = next_node[depot];
+  int32_t guard = 0;
+  while (w < n) {
+    if (w <= 0 || w >= n || node_route[w] != route_id)
+      return false;
+    float arrival = route_time + dist(prev, w);
+    if (arrival > due_time[w] + 1e-6f)
+      return false;
+    route_time = std::max(arrival, ready_time[w]);
+    if (route_time + dist(w, 0) > due_time[0] + 1e-6f)
+      return false;
+    prev = w;
+    w = next_node[w];
+    if (++guard > n)
+      return false;
+  }
+
+  return route_time + dist(prev, 0) <= due_time[0] + 1e-6f;
+}
+
+bool MFACO_CVRP::linked_solution_feasible(
+    int32_t num_routes, const std::vector<int32_t> &next_node,
+    const std::vector<int32_t> &node_route,
+    const std::vector<int64_t> &route_loads) const {
+  for (int32_t r = 0; r < num_routes; ++r) {
+    if (!linked_route_feasible(r, next_node, node_route, route_loads))
+      return false;
   }
   return true;
 }
@@ -1515,111 +1620,117 @@ void MFACO_CVRP::build_d0() {
 // -------------------- initial perm (greedy NN on customers, score by split)
 // --------------------
 void MFACO_CVRP::build_initial_solution() {
-  // Greedy construction with capacity constraint
-  // Result is a valid Tour with 0s
   float best_c = std::numeric_limits<float>::max();
   best_route.clear();
 
   int32_t num_starts = std::min(8, n);
-
   std::vector<int32_t> current_route;
   current_route.reserve(n * 2);
   std::vector<uint8_t> visited(n, 0);
 
+  auto candidate_fits = [&](int32_t prev, int32_t v, int64_t load,
+                            float route_time) -> bool {
+    if (v <= 0 || v >= n || visited[v])
+      return false;
+    if (load + demand_int[v] > capacity_int)
+      return false;
+    if (!has_time_windows)
+      return true;
+    return can_append_tw(prev, v, route_time);
+  };
+
   for (int32_t s = 0; s < num_starts; ++s) {
     current_route.clear();
+    current_route.push_back(0);
     std::fill(visited.begin(), visited.end(), 0);
     visited[0] = 1;
 
-    int32_t start_node = 1 + (s % (n - 1));
+    int32_t curr = 0;
+    int64_t route_load = 0;
+    float route_time = 0.0f;
+    float cost = 0.0f;
+    int32_t visited_cnt = 0;
 
-    // Start with explicit customer
-    current_route.push_back(start_node);
-    visited[start_node] = 1;
-
-    int32_t curr = start_node;
-    int64_t cur_cap = capacity_int - demand_int[start_node];
-    float cost = dist(0, start_node);
-
-    int32_t visited_cnt = 1;
-    while (visited_cnt < n - 1) {
+    while (visited_cnt < m) {
       int32_t best_nb = -1;
-      float min_d = 1e9f;
+      float min_d = std::numeric_limits<float>::max();
 
-      // Try NN list
-      for (int32_t j = 0; j < k; ++j) {
-        int32_t v = nn_list[curr * k + j];
-        if (v > 0 && !visited[v]) {
-          if (demand_int[v] <= cur_cap) {
-            float d = dist(curr, v);
-            if (d < min_d) {
-              min_d = d;
-              best_nb = v;
-              break; // NN is sorted
-            }
+      int32_t lookup = curr;
+      if (lookup >= 0 && lookup < n) {
+        for (int32_t j = 0; j < k; ++j) {
+          int32_t v = nn_list[lookup * k + j];
+          if (candidate_fits(curr, v, route_load, route_time)) {
+            best_nb = v;
+            min_d = dist(curr, v);
+            break;
           }
         }
       }
 
-      // If not found in NN or cap violation, try all
       if (best_nb == -1) {
-        bool can_fit = false;
-        for (int32_t v = 1; v < n; ++v) {
-          if (!visited[v] && demand_int[v] <= cur_cap) {
-            can_fit = true;
-            if (dist(curr, v) < min_d) {
-              min_d = dist(curr, v);
-              best_nb = v;
-            }
+        int32_t offset = (visited_cnt == 0 && n > 1) ? (s % (n - 1)) : 0;
+        for (int32_t t = 0; t < m; ++t) {
+          int32_t v = 1 + ((offset + t) % m);
+          if (!candidate_fits(curr, v, route_load, route_time))
+            continue;
+          float d = dist(curr, v);
+          if (d < min_d) {
+            min_d = d;
+            best_nb = v;
           }
         }
-        if (!can_fit) {
-          // Must return to depot
-          cost += dist(curr, 0);
-          current_route.push_back(0); // Depot
-          curr = 0;
-          cur_cap = capacity_int;
-          continue;
-        }
       }
 
-      if (best_nb != -1) {
-        visited[best_nb] = 1;
-        visited_cnt++;
-        current_route.push_back(best_nb);
-        cost += dist(curr, best_nb);
-        cur_cap -= demand_int[best_nb];
-        curr = best_nb;
+      if (best_nb == -1) {
+        if (curr == 0)
+          break;
+        cost += dist(curr, 0);
+        current_route.push_back(0);
+        curr = 0;
+        route_load = 0;
+        route_time = 0.0f;
+        continue;
       }
+
+      float arrival = route_time + dist(curr, best_nb);
+      cost += dist(curr, best_nb);
+      current_route.push_back(best_nb);
+      visited[best_nb] = 1;
+      visited_cnt++;
+      route_load += demand_int[best_nb];
+      route_time = has_time_windows ? std::max(arrival, ready_time[best_nb])
+                                    : arrival;
+      curr = best_nb;
     }
-    // Return to depot
-    cost += dist(curr, 0);
-    // current_route implicitly ends at curr. Add final 0?
-    // If we conform to [0, c1, ..., 0], let's fix it after.
 
-    if (cost < best_c) {
+    if (curr != 0) {
+      cost += dist(curr, 0);
+      current_route.push_back(0);
+    }
+
+    if (visited_cnt == m && route_fully_feasible(current_route) && cost < best_c) {
       best_c = cost;
       best_route = current_route;
     }
   }
 
-  // Canonicalize best_route to [0, ..., 0]
-  if (!best_route.empty()) {
-    std::vector<int32_t> full;
-    full.reserve(best_route.size() + 2);
-    full.push_back(0);
-    for (int32_t x : best_route)
-      full.push_back(x);
-    full.push_back(0);
-    best_route = full;
-
-    source_cost = best_c;
-    best_cost = best_c;
-    source_route = best_route;
+  if (best_route.empty()) {
+    best_route.clear();
+    best_route.push_back(0);
+    for (int32_t v = 1; v < n; ++v) {
+      best_route.push_back(v);
+      best_route.push_back(0);
+    }
+    best_c = 0.0f;
+    for (size_t i = 0; i + 1 < best_route.size(); ++i)
+      best_c += dist(best_route[i], best_route[i + 1]);
   }
 
-  // Use simple min-max for initial
-  tau_max = 1.0f / (rho * best_cost);
+  source_cost = best_c;
+  best_cost = best_c;
+  source_route = best_route;
+
+  tau_max = 1.0f / (rho * best_cost + EPS);
   tau_min = tau_max * 0.001f;
   std::fill(pheromone_sparse.begin(), pheromone_sparse.end(), tau_max);
 }
@@ -1947,6 +2058,10 @@ void MFACO_CVRP::sample(bool require_prob, const float *prior_ptr,
 // --------------------
 void MFACO_CVRP::update_pheromone(const std::vector<int32_t> &best_route_in,
                                   float new_best_cost) {
+  if (has_time_windows && !route_fully_feasible(best_route_in)) {
+    return;
+  }
+
   // Update global best
   if (new_best_cost < best_cost) {
     best_cost = new_best_cost;
@@ -3679,121 +3794,18 @@ float MFACO_CVRP::sample_ant_direct(const float *probmat, int32_t start_node,
     }
 
     // Select Next Node 'v'
-    int32_t chosen = -1;
-
-    // A. Candidate List
-    {
-      int32_t candidates[MAX_CAND_LIST_SIZE + 1];
-      float probs[MAX_CAND_LIST_SIZE + 1];
-      int32_t c_size = 0;
-      float sum_prob = 0.0f;
-
-      // Use `curr` for NN lookup. If curr is depot (>=n), use 0.
-      int32_t lookup_node = (curr >= n) ? 0 : curr;
-      const float *row_prob = probmat + (size_t)lookup_node * k;
-
-      for (int32_t j = 0; j < k; ++j) {
-        int32_t v = nn_list[lookup_node * k + j];
-        // Filter
-        if (v == 0) {
-          // Depot is valid target? Only if curr is NOT depot
-          if (curr >= n)
-            continue;
-        } else {
-          if (v < 0 || v >= n)
-            continue;
-          if (visited[v])
-            continue;
-
-          // Capacity Check: can we put v after curr?
-          // If v is in same route already: Moving it doesn't increase total
-          // load unless we duplicate (we relocate). So only check if differernt
-          // route.
-          int32_t r_v = node_route[v];
-          if (r_v != r_curr) {
-            if (route_loads[r_curr] + demand_int[v] > capacity_int)
-              continue;
-          }
-        }
-
-        candidates[c_size] = v;
-        probs[c_size] = row_prob[j];
-        sum_prob += row_prob[j];
-        c_size++;
-      }
-
-      if (c_size > 0) {
-        float r = rng.next_float() * sum_prob;
-        float run = 0.0f;
-        chosen = candidates[c_size - 1];
-        for (int32_t i = 0; i < c_size; ++i) {
-          run += probs[i];
-          if (r <= run) {
-            chosen = candidates[i];
-            break;
-          }
-        }
-      }
-    }
-
-    // B. Backup List
-    if (chosen == -1) {
-      int32_t lookup_node = (curr >= n) ? 0 : curr;
-      for (int32_t j = 0; j < bl; ++j) {
-        int32_t v = backup_list[lookup_node * bl + j];
-        if (v == 0) {
-          if (curr >= n)
-            continue;
-          chosen = 0;
-          break;
-        }
-        if (v > 0 && v < n && !visited[v]) {
-          int32_t r_v = node_route[v];
-          if (r_curr == r_v ||
-              route_loads[r_curr] + demand_int[v] <= capacity_int) {
-            chosen = v;
-            break;
-          }
-        }
-      }
-    }
-
-    // C. Global Fallback (Closest Valid Unvisited)
-    if (chosen == -1) {
-      float min_d = std::numeric_limits<float>::max();
-      int32_t best_global = -1;
-      int32_t lookup_node = (curr >= n) ? 0 : curr;
-
-      // Optimization: Skip if we simply can't find anything?
-      // We must scan.
-      for (int32_t v = 1; v < n; ++v) {
-        if (!visited[v]) {
-          int32_t r_v = node_route[v];
-          if (r_curr == r_v ||
-              route_loads[r_curr] + demand_int[v] <= capacity_int) {
-            float d = dist(lookup_node, v);
-            if (d < min_d) {
-              min_d = d;
-              best_global = v;
-            }
-          }
-        }
-      }
-      // Also consider Depot (0) as fallback to close route?
-      // If we can't find any customer, we MUST close route.
-      if (best_global == -1) {
-        if (curr < n)
-          chosen = 0; // Force close/split if customer
-      } else {
-        // Check if depot is closer than best_global?
-        float d_depot = dist(lookup_node, 0);
-        if (curr < n && d_depot < min_d) {
-          chosen = 0;
-        } else {
-          chosen = best_global;
-        }
-      }
-    }
+    int16_t pick_j = -1;
+    uint64_t valid_mask = 0;
+    int32_t lookup_node = (curr >= n) ? 0 : curr;
+    const float *row_prob = probmat + (size_t)lookup_node * k;
+    auto [chosen, is_stoch, log_prob] =
+        select_next_node(curr, r_curr, row_prob, visited, node_route,
+                         route_loads, next_node, prev_node, num_routes,
+                         max_routes, rng, pick_j, valid_mask);
+    (void)is_stoch;
+    (void)log_prob;
+    (void)pick_j;
+    (void)valid_mask;
 
     if (chosen == -1)
       break;
@@ -3972,8 +3984,13 @@ float MFACO_CVRP::sample_ant_direct(const float *probmat, int32_t start_node,
     intra_route_ls(route_out, checklist);
   }
 
-  if (has_time_windows && !route_time_feasible(route_out))
+  if (has_time_windows && !route_fully_feasible(route_out))
     route_out.swap(route_before_ls);
+  if (has_time_windows && !route_fully_feasible(route_out)) {
+    enforce_time_windows(route_out);
+    if (!route_fully_feasible(route_out))
+      route_out = source_route;
+  }
 
   // Calculate final cost
   float final_cost = 0.0f;
@@ -3987,8 +4004,11 @@ float MFACO_CVRP::sample_ant_direct(const float *probmat, int32_t start_node,
 std::tuple<int32_t, bool, float> MFACO_CVRP::select_next_node(
     int32_t curr, int32_t curr_route, const float *probmat_row,
     const std::vector<uint8_t> &visited, const std::vector<int32_t> &node_route,
-    const std::vector<int64_t> &route_loads, Xoshiro128Plus &rng,
-    int16_t &out_pick_j, uint64_t &out_valid_mask) {
+    const std::vector<int64_t> &route_loads,
+    const std::vector<int32_t> &next_node,
+    const std::vector<int32_t> &prev_node, int32_t num_routes,
+    int32_t max_routes, Xoshiro128Plus &rng, int16_t &out_pick_j,
+    uint64_t &out_valid_mask) {
   int32_t c_size = 0;
   float sum_prob = 0.0f;
   out_valid_mask = 0;
@@ -4001,6 +4021,98 @@ std::tuple<int32_t, bool, float> MFACO_CVRP::select_next_node(
 
   int32_t lookup_node = (curr >= n) ? 0 : curr;
 
+  auto route_state_feasible = [&](const std::vector<int32_t> &nn,
+                                  const std::vector<int32_t> &nr,
+                                  const std::vector<int64_t> &rl,
+                                  int32_t routes) -> bool {
+    if (!has_time_windows)
+      return true;
+    return linked_solution_feasible(routes, nn, nr, rl);
+  };
+
+  auto can_take_customer = [&](int32_t v) -> bool {
+    if (v <= 0 || v >= n || visited[v])
+      return false;
+    int32_t v_route = node_route[v];
+    if (curr_route < 0 || v_route < 0)
+      return false;
+    if (curr_route != v_route && route_loads[curr_route] + demand_int[v] > capacity_int)
+      return false;
+    if (!has_time_windows)
+      return true;
+
+    std::vector<int32_t> nn = next_node;
+    std::vector<int32_t> pp = prev_node;
+    std::vector<int32_t> nr = node_route;
+    std::vector<int64_t> rl = route_loads;
+
+    int32_t prev_v = pp[v];
+    int32_t next_v = nn[v];
+    if (prev_v == curr)
+      return linked_route_feasible(curr_route, nn, nr, rl);
+
+    nn[prev_v] = next_v;
+    pp[next_v] = prev_v;
+
+    int32_t next_c = nn[curr];
+    nn[curr] = v;
+    pp[v] = curr;
+    nn[v] = next_c;
+    pp[next_c] = v;
+
+    if (curr_route != v_route) {
+      rl[v_route] -= demand_int[v];
+      rl[curr_route] += demand_int[v];
+      nr[v] = curr_route;
+    }
+
+    return route_state_feasible(nn, nr, rl, num_routes);
+  };
+
+  auto can_take_depot = [&]() -> bool {
+    if (curr >= n || curr_route < 0)
+      return false;
+    if (!has_time_windows)
+      return true;
+    int32_t next_c = next_node[curr];
+    if (next_c >= n)
+      return linked_route_feasible(curr_route, next_node, node_route, route_loads);
+    if (num_routes >= max_routes)
+      return false;
+
+    std::vector<int32_t> nn = next_node;
+    std::vector<int32_t> pp = prev_node;
+    std::vector<int32_t> nr = node_route;
+    std::vector<int64_t> rl = route_loads;
+
+    int32_t r_new = num_routes;
+    int32_t new_depot = n + r_new;
+    int32_t old_depot = n + curr_route;
+    int32_t route_end = pp[old_depot];
+
+    nn[curr] = old_depot;
+    pp[old_depot] = curr;
+    nn[new_depot] = next_c;
+    pp[next_c] = new_depot;
+    nn[route_end] = new_depot;
+    pp[new_depot] = route_end;
+
+    int64_t load_shift = 0;
+    int32_t w = next_c;
+    int32_t guard = 0;
+    while (w != new_depot && w < n) {
+      nr[w] = r_new;
+      load_shift += demand_int[w];
+      w = nn[w];
+      if (++guard > 2 * n)
+        return false;
+    }
+    rl[curr_route] -= load_shift;
+    rl[r_new] = load_shift;
+
+    return route_state_feasible(nn, nr, rl, num_routes + 1);
+  };
+
   // A. NN List
   for (int32_t j = 0; j < k; ++j) {
     int32_t v = nn_list[lookup_node * k + j];
@@ -4011,15 +4123,7 @@ std::tuple<int32_t, bool, float> MFACO_CVRP::select_next_node(
     if (visited[v])
       continue;
 
-    int32_t v_route = node_route[v];
-    bool can_relocate = true;
-    if (curr_route >= 0 && v_route >= 0 && curr_route != v_route) {
-      int64_t new_load = route_loads[curr_route] + demand_int[v];
-      if (new_load > capacity_int)
-        can_relocate = false;
-    }
-
-    if (can_relocate) {
+    if (can_take_customer(v)) {
       float p = probmat_row[j];
       candidates[c_size] = v;
       probs[c_size] = p;
@@ -4040,15 +4144,7 @@ std::tuple<int32_t, bool, float> MFACO_CVRP::select_next_node(
       if (visited[v])
         continue;
 
-      int32_t v_route = node_route[v];
-      bool can_relocate = true;
-      if (curr_route >= 0 && v_route >= 0 && curr_route != v_route) {
-        int64_t new_load = route_loads[curr_route] + demand_int[v];
-        if (new_load > capacity_int)
-          can_relocate = false;
-      }
-
-      if (can_relocate) {
+      if (can_take_customer(v)) {
         candidates[c_size] = v;
         probs[c_size] = 1.0f;
         j_indices[c_size] = -1;
@@ -4066,10 +4162,7 @@ std::tuple<int32_t, bool, float> MFACO_CVRP::select_next_node(
 
     for (int32_t v = 1; v < n; ++v) {
       if (!visited[v]) {
-        int32_t r_v = node_route[v];
-        if (curr_route == r_v ||
-            (curr_route >= 0 &&
-             route_loads[curr_route] + demand_int[v] <= capacity_int)) {
+        if (can_take_customer(v)) {
           float d = dist(lookup_node, v);
           if (d < min_d) {
             min_d = d;
@@ -4080,11 +4173,11 @@ std::tuple<int32_t, bool, float> MFACO_CVRP::select_next_node(
     }
 
     if (best_global == -1) {
-      if (curr < n)
+      if (can_take_depot())
         best_global = 0;
     } else {
       float d_depot = dist(lookup_node, 0);
-      if (curr < n && d_depot < min_d) {
+      if (d_depot < min_d && can_take_depot()) {
         best_global = 0;
       }
     }
@@ -4283,7 +4376,8 @@ float MFACO_CVRP::sample_ant_direct_traced(
 
     auto [chosen, is_stoch, log_prob] =
         select_next_node(curr, r_curr, row_prob, visited, node_route,
-                         route_loads, rng, pick_j, valid_mask);
+                         route_loads, next_node, prev_node, num_routes,
+                         max_routes, rng, pick_j, valid_mask);
 
     if (chosen == -1)
       break;
@@ -4488,8 +4582,13 @@ float MFACO_CVRP::sample_ant_direct_traced(
     inter_route_ls_optimized(route_out, pos_ls, checklist, in_checklist);
     // Intra-Route LS (2-opt)
     intra_route_ls(route_out, checklist);
-    if (has_time_windows && !route_time_feasible(route_out))
+    if (has_time_windows && !route_fully_feasible(route_out))
       route_out.swap(route_before_ls);
+  }
+  if (has_time_windows && !route_fully_feasible(route_out)) {
+    enforce_time_windows(route_out);
+    if (!route_fully_feasible(route_out))
+      route_out = source_route;
   }
 
   // Calculate final cost

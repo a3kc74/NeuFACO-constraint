@@ -92,6 +92,29 @@ def test_cvrptw_local_search_preserves_time_windows():
     assert_cvrptw_solution(coords, demand, windows, capacity, costs, routes)
 
 
+def test_cvrptw_initial_routes_are_time_window_feasible():
+    coords, demand, windows, capacity = gfacs_instance(20)
+    solver = MFACO_CVRPTW(coords, demand, windows, capacity, n_ants=2, use_local_search=False, cand_list_size=8)
+
+    source = np.asarray(solver.source_route, dtype=np.int32)
+    best = np.asarray(solver.best_route, dtype=np.int32)
+
+    assert_cvrptw_solution(coords, demand, windows, capacity, [route_distance(coords, source)], [source])
+    assert_cvrptw_solution(coords, demand, windows, capacity, [route_distance(coords, best)], [best])
+
+def test_cvrptw_rejects_infeasible_pheromone_update_route():
+    coords, demand, windows, capacity = gfacs_instance(20)
+    solver = MFACO_CVRPTW(coords, demand, windows, capacity, n_ants=2, use_local_search=False, cand_list_size=8)
+    original_source = np.asarray(solver.source_route, dtype=np.int32).copy()
+    original_best = np.asarray(solver.best_route, dtype=np.int32).copy()
+
+    infeasible = np.arange(0, len(coords), dtype=np.int32)
+    infeasible = np.concatenate([infeasible, np.array([0], dtype=np.int32)])
+    solver.update_pheromone(infeasible, 0.001)
+
+    np.testing.assert_array_equal(np.asarray(solver.source_route, dtype=np.int32), original_source)
+    np.testing.assert_array_equal(np.asarray(solver.best_route, dtype=np.int32), original_best)
+
 def test_cvrptw_validates_windows_shape():
     coords, demand, windows, capacity = gfacs_instance(20)
 

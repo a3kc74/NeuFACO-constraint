@@ -599,6 +599,15 @@ private:
   void build_initial_solution();
 
   bool route_time_feasible(const std::vector<int32_t> &route) const;
+  bool route_fully_feasible(const std::vector<int32_t> &route) const;
+  bool linked_route_feasible(int32_t route_id,
+                             const std::vector<int32_t> &next_node,
+                             const std::vector<int32_t> &node_route,
+                             const std::vector<int64_t> &route_loads) const;
+  bool linked_solution_feasible(int32_t num_routes,
+                                const std::vector<int32_t> &next_node,
+                                const std::vector<int32_t> &node_route,
+                                const std::vector<int64_t> &route_loads) const;
   bool can_append_tw(int32_t prev, int32_t node, float route_time) const;
   void enforce_time_windows(std::vector<int32_t> &route) const;
 
@@ -609,7 +618,10 @@ private:
   select_next_node(int32_t curr, int32_t curr_route, const float *probmat_row,
                    const std::vector<uint8_t> &visited,
                    const std::vector<int32_t> &node_route,
-                   const std::vector<int64_t> &route_loads, Xoshiro128Plus &rng,
+                   const std::vector<int64_t> &route_loads,
+                   const std::vector<int32_t> &next_node,
+                   const std::vector<int32_t> &prev_node, int32_t num_routes,
+                   int32_t max_routes, Xoshiro128Plus &rng,
                    int16_t &out_pick_j, uint64_t &out_valid_mask);
 
   // ---- MFACO sampling primitives on giant tour ----

@@ -655,6 +655,10 @@ class MFACO_CVRP:
     @property
     def source_route(self) -> np.ndarray:
         return np.asarray(self._cpp.source_route)
+
+    @property
+    def best_route(self) -> np.ndarray:
+        return np.asarray(self._cpp.best_route)
     
     @property
     def enable_torch_sync(self) -> bool:
