@@ -92,6 +92,18 @@ def test_cvrptw_local_search_preserves_time_windows():
     assert_cvrptw_solution(coords, demand, windows, capacity, costs, routes)
 
 
+def test_cvrptw_local_search_preserves_tight_time_windows_across_seeds():
+    coords, demand, windows, capacity = gfacs_instance(32)
+
+    for seed in range(10):
+        solver = MFACO_CVRPTW(coords, demand, windows, capacity, n_ants=6, use_local_search=True, cand_list_size=12)
+        solver.seed_rng(seed)
+
+        costs, routes, *_ = solver.sample()
+
+        assert_cvrptw_solution(coords, demand, windows, capacity, costs, routes)
+
+
 def test_cvrptw_initial_routes_are_time_window_feasible():
     coords, demand, windows, capacity = gfacs_instance(20)
     solver = MFACO_CVRPTW(coords, demand, windows, capacity, n_ants=2, use_local_search=False, cand_list_size=8)

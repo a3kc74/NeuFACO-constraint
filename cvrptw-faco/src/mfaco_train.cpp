@@ -1033,6 +1033,33 @@ float MFACO_CVRP::intra_route_ls(std::vector<int32_t> &route,
   if (routes.empty())
     return 0.0f;
 
+  auto sequence_feasible = [&](const std::vector<int32_t> &seq) -> bool {
+    int64_t route_load = 0;
+    float route_time = 0.0f;
+    int32_t prev = 0;
+
+    for (int32_t node : seq) {
+      if (node <= 0 || node >= n)
+        return false;
+      route_load += demand_int[node];
+      if (route_load > capacity_int)
+        return false;
+      if (has_time_windows) {
+        float arrival = route_time + dist(prev, node);
+        if (arrival > due_time[node] + 1e-6f)
+          return false;
+        route_time = std::max(arrival, ready_time[node]);
+        if (route_time + dist(node, 0) > due_time[0] + 1e-6f)
+          return false;
+      }
+      prev = node;
+    }
+
+    if (has_time_windows)
+      return route_time + dist(prev, 0) <= due_time[0] + 1e-6f;
+    return true;
+  };
+
   // Build positions within each route
   std::vector<int32_t> pos_in_route(n, -1);
   for (size_t r = 0; r < routes.size(); ++r) {
@@ -1158,6 +1185,10 @@ float MFACO_CVRP::intra_route_ls(std::vector<int32_t> &route,
     // Apply best move if found
     if (max_diff > 1e-6f && best_i >= 0 && best_j > best_i) {
       std::reverse(seq.begin() + best_i, seq.begin() + best_j);
+      if (!sequence_feasible(seq)) {
+        std::reverse(seq.begin() + best_i, seq.begin() + best_j);
+        continue;
+      }
       total_improvement += max_diff;
 
       // Update positions
@@ -1349,6 +1380,20 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
 
             update_route_state(n + r_u, r_u);
             update_route_state(n + r_v, r_v);
+            if (!linked_route_feasible(r_u, next_node, node_route,
+                                       route_loads) ||
+                !linked_route_feasible(r_v, next_node, node_route,
+                                       route_loads)) {
+              next_node[prev_u] = u;
+              prev_node[u] = prev_u;
+              next_node[u] = next_u;
+              prev_node[next_u] = u;
+              next_node[v] = old_next_v;
+              prev_node[old_next_v] = v;
+              update_route_state(n + r_u, r_u);
+              update_route_state(n + r_v, r_v);
+              continue;
+            }
             touch(u);
             touch(v);
             touch(prev_u);
@@ -1382,6 +1427,20 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
 
             update_route_state(n + r_u, r_u);
             update_route_state(n + r_v, r_v);
+            if (!linked_route_feasible(r_u, next_node, node_route,
+                                       route_loads) ||
+                !linked_route_feasible(r_v, next_node, node_route,
+                                       route_loads)) {
+              next_node[prev_u] = u;
+              prev_node[u] = prev_u;
+              next_node[u] = next_u;
+              prev_node[next_u] = u;
+              next_node[prev_v] = v;
+              prev_node[v] = prev_v;
+              update_route_state(n + r_u, r_u);
+              update_route_state(n + r_v, r_v);
+              continue;
+            }
             // Touches
             touch(u);
             touch(prev_v);
@@ -1420,6 +1479,22 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
 
             update_route_state(n + r_u, r_u);
             update_route_state(n + r_v, r_v);
+            if (!linked_route_feasible(r_u, next_node, node_route,
+                                       route_loads) ||
+                !linked_route_feasible(r_v, next_node, node_route,
+                                       route_loads)) {
+              next_node[pu] = u;
+              prev_node[u] = pu;
+              next_node[u] = nu;
+              prev_node[nu] = u;
+              next_node[pv] = v;
+              prev_node[v] = pv;
+              next_node[v] = nv;
+              prev_node[nv] = v;
+              update_route_state(n + r_u, r_u);
+              update_route_state(n + r_v, r_v);
+              continue;
+            }
             touch(u);
             touch(v);
             touch(pu);
@@ -1454,6 +1529,18 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
 
             update_route_state(n + r_u, r_u);
             update_route_state(n + r_v, r_v);
+            if (!linked_route_feasible(r_u, next_node, node_route,
+                                       route_loads) ||
+                !linked_route_feasible(r_v, next_node, node_route,
+                                       route_loads)) {
+              next_node[u] = nu;
+              prev_node[nu] = u;
+              next_node[v] = nv;
+              prev_node[nv] = v;
+              update_route_state(n + r_u, r_u);
+              update_route_state(n + r_v, r_v);
+              continue;
+            }
             touch(u);
             touch(v);
             touch(nu);
