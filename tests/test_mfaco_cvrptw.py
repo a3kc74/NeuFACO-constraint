@@ -104,6 +104,49 @@ def test_cvrptw_local_search_preserves_tight_time_windows_across_seeds():
         assert_cvrptw_solution(coords, demand, windows, capacity, costs, routes)
 
 
+def test_cvrptw_segment_local_search_preserves_tight_capacity_and_windows():
+    coords = np.array(
+        [
+            [0.0, 0.0],
+            [0.10, 0.00],
+            [0.20, 0.00],
+            [0.30, 0.00],
+            [0.00, 0.10],
+            [0.00, 0.20],
+            [0.00, 0.30],
+            [0.30, 0.30],
+            [0.20, 0.30],
+            [0.10, 0.30],
+        ],
+        dtype=np.float32,
+    )
+    demand = np.array([0.0, 0.35, 0.25, 0.30, 0.40, 0.20, 0.35, 0.25, 0.35, 0.20], dtype=np.float32)
+    windows = np.array(
+        [
+            [0.0, 3.0],
+            [0.0, 0.75],
+            [0.0, 0.85],
+            [0.0, 1.00],
+            [0.0, 0.75],
+            [0.0, 0.90],
+            [0.0, 1.10],
+            [0.0, 1.20],
+            [0.0, 1.10],
+            [0.0, 0.95],
+        ],
+        dtype=np.float32,
+    )
+    capacity = 0.75
+
+    for seed in range(12):
+        solver = MFACO_CVRPTW(coords, demand, windows, capacity, n_ants=8, use_local_search=True, cand_list_size=9)
+        solver.seed_rng(seed)
+
+        costs, routes, *_ = solver.sample()
+
+        assert_cvrptw_solution(coords, demand, windows, capacity, costs, routes)
+
+
 def test_cvrptw_initial_routes_are_time_window_feasible():
     coords, demand, windows, capacity = gfacs_instance(20)
     solver = MFACO_CVRPTW(coords, demand, windows, capacity, n_ants=2, use_local_search=False, cand_list_size=8)

@@ -1280,6 +1280,11 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
     route_loads[route_id] = load;
   };
 
+  auto affected_routes_feasible = [&](int32_t r_a, int32_t r_b) {
+    return linked_route_feasible(r_a, next_node, node_route, route_loads) &&
+           linked_route_feasible(r_b, next_node, node_route, route_loads);
+  };
+
   // Focused LS: only process nodes in checklist (no fallback to all nodes)
   if (checklist.empty()) {
     return 0.0f; // Nothing to do
@@ -1454,7 +1459,103 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
         }
       }
 
-      // B. Swap u, v
+      // B. Or-opt(2,0): relocate consecutive pair u,next_u after v.
+      if (r_u != r_v && next_u < n) {
+        int32_t u2 = next_u;
+        int32_t next_u2 = next_node[u2];
+        int64_t segment_load = demand_int[u] + demand_int[u2];
+        if (route_loads[r_v] + segment_load <= capacity_int) {
+          int32_t prev_u = prev_node[u];
+          float delta = dist(prev_u, next_u2) + dist(v, u) +
+                        dist(u2, next_v) - dist(prev_u, u) -
+                        dist(u2, next_u2) - dist(v, next_v);
+
+          if (delta < -EPS) {
+            next_node[prev_u] = next_u2;
+            prev_node[next_u2] = prev_u;
+            next_node[v] = u;
+            prev_node[u] = v;
+            next_node[u2] = next_v;
+            prev_node[next_v] = u2;
+
+            update_route_state(n + r_u, r_u);
+            update_route_state(n + r_v, r_v);
+            if (!affected_routes_feasible(r_u, r_v)) {
+              next_node[prev_u] = u;
+              prev_node[u] = prev_u;
+              next_node[u2] = next_u2;
+              prev_node[next_u2] = u2;
+              next_node[v] = next_v;
+              prev_node[next_v] = v;
+              update_route_state(n + r_u, r_u);
+              update_route_state(n + r_v, r_v);
+              continue;
+            }
+
+            touch(prev_u);
+            touch(u);
+            touch(u2);
+            touch(next_u2);
+            touch(v);
+            touch(next_v);
+            improved = true;
+            total_improvement -= delta;
+            break;
+          }
+        }
+      }
+
+      // C. Reversed Or-opt(2,0): relocate pair u,next_u as next_u,u.
+      if (r_u != r_v && next_u < n) {
+        int32_t u2 = next_u;
+        int32_t next_u2 = next_node[u2];
+        int64_t segment_load = demand_int[u] + demand_int[u2];
+        if (route_loads[r_v] + segment_load <= capacity_int) {
+          int32_t prev_u = prev_node[u];
+          float delta = dist(prev_u, next_u2) + dist(v, u2) +
+                        dist(u, next_v) - dist(prev_u, u) -
+                        dist(u2, next_u2) - dist(v, next_v);
+
+          if (delta < -EPS) {
+            next_node[prev_u] = next_u2;
+            prev_node[next_u2] = prev_u;
+            next_node[v] = u2;
+            prev_node[u2] = v;
+            next_node[u2] = u;
+            prev_node[u] = u2;
+            next_node[u] = next_v;
+            prev_node[next_v] = u;
+
+            update_route_state(n + r_u, r_u);
+            update_route_state(n + r_v, r_v);
+            if (!affected_routes_feasible(r_u, r_v)) {
+              next_node[prev_u] = u;
+              prev_node[u] = prev_u;
+              next_node[u] = u2;
+              prev_node[u2] = u;
+              next_node[u2] = next_u2;
+              prev_node[next_u2] = u2;
+              next_node[v] = next_v;
+              prev_node[next_v] = v;
+              update_route_state(n + r_u, r_u);
+              update_route_state(n + r_v, r_v);
+              continue;
+            }
+
+            touch(prev_u);
+            touch(u);
+            touch(u2);
+            touch(next_u2);
+            touch(v);
+            touch(next_v);
+            improved = true;
+            total_improvement -= delta;
+            break;
+          }
+        }
+      }
+
+      // D. Swap u, v
       if (use_swap && r_u != r_v) {
         int64_t load_u_new = route_loads[r_u] - demand_int[u] + demand_int[v];
         int64_t load_v_new = route_loads[r_v] - demand_int[v] + demand_int[u];
@@ -1508,7 +1609,8 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
         }
       }
 
-      // C. 2-Opt*
+
+      // E. 2-Opt*
       if (use_2opt_star && r_u != r_v) {
         int64_t head_u = cum_demand[u];
         int64_t tail_u = route_loads[r_u] - head_u;
@@ -1549,10 +1651,118 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
             total_improvement -= delta;
             break;
           }
+      // F. Exchange(2,1): exchange consecutive pair u,next_u with v.
+      if (r_u != r_v && next_u < n) {
+        int32_t u2 = next_u;
+        int32_t next_u2 = next_node[u2];
+        int32_t prev_u = prev_node[u];
+        int32_t prev_v = prev_node[v];
+        int64_t segment_load = demand_int[u] + demand_int[u2];
+        int64_t load_u_new = route_loads[r_u] - segment_load + demand_int[v];
+        int64_t load_v_new = route_loads[r_v] - demand_int[v] + segment_load;
+
+        if (load_u_new <= capacity_int && load_v_new <= capacity_int) {
+          float delta = dist(prev_u, v) + dist(v, next_u2) + dist(prev_v, u) +
+                        dist(u2, next_v) - dist(prev_u, u) -
+                        dist(u2, next_u2) - dist(prev_v, v) -
+                        dist(v, next_v);
+
+          if (delta < -EPS) {
+            next_node[prev_u] = v;
+            prev_node[v] = prev_u;
+            next_node[v] = next_u2;
+            prev_node[next_u2] = v;
+            next_node[prev_v] = u;
+            prev_node[u] = prev_v;
+            next_node[u2] = next_v;
+            prev_node[next_v] = u2;
+
+            update_route_state(n + r_u, r_u);
+            update_route_state(n + r_v, r_v);
+            if (!affected_routes_feasible(r_u, r_v)) {
+              next_node[prev_u] = u;
+              prev_node[u] = prev_u;
+              next_node[u2] = next_u2;
+              prev_node[next_u2] = u2;
+              next_node[prev_v] = v;
+              prev_node[v] = prev_v;
+              next_node[v] = next_v;
+              prev_node[next_v] = v;
+              update_route_state(n + r_u, r_u);
+              update_route_state(n + r_v, r_v);
+              continue;
+            }
+
+            touch(prev_u);
+            touch(u);
+            touch(u2);
+            touch(next_u2);
+            touch(prev_v);
+            touch(v);
+            touch(next_v);
+            improved = true;
+            total_improvement -= delta;
+            break;
+          }
         }
       }
+
+        }
+      }
+      // G. Or-opt(3,0): lower-priority candidate-restricted segment move.
+      if (r_u != r_v && next_u < n) {
+        int32_t u2 = next_u;
+        int32_t u3 = next_node[u2];
+        if (u3 < n) {
+          int32_t next_u3 = next_node[u3];
+          int64_t segment_load = demand_int[u] + demand_int[u2] + demand_int[u3];
+          if (route_loads[r_v] + segment_load <= capacity_int) {
+            int32_t prev_u = prev_node[u];
+            float delta = dist(prev_u, next_u3) + dist(v, u) +
+                          dist(u3, next_v) - dist(prev_u, u) -
+                          dist(u3, next_u3) - dist(v, next_v);
+
+            if (delta < -EPS) {
+              next_node[prev_u] = next_u3;
+              prev_node[next_u3] = prev_u;
+              next_node[v] = u;
+              prev_node[u] = v;
+              next_node[u3] = next_v;
+              prev_node[next_v] = u3;
+
+              update_route_state(n + r_u, r_u);
+              update_route_state(n + r_v, r_v);
+              if (!affected_routes_feasible(r_u, r_v)) {
+                next_node[prev_u] = u;
+                prev_node[u] = prev_u;
+                next_node[u3] = next_u3;
+                prev_node[next_u3] = u3;
+                next_node[v] = next_v;
+                prev_node[next_v] = v;
+                update_route_state(n + r_u, r_u);
+                update_route_state(n + r_v, r_v);
+                continue;
+              }
+
+              touch(prev_u);
+              touch(u);
+              touch(u2);
+              touch(u3);
+              touch(next_u3);
+              touch(v);
+              touch(next_v);
+              improved = true;
+              total_improvement -= delta;
+              break;
+            }
+          }
+        }
+      }
+
     }
-    if (!improved)
+    if (improved)
+      head = 0;
+    else
       dlb[u] = true;
   }
 
@@ -1900,7 +2110,7 @@ float MFACO_CVRP::sample_ant_direct(const float *probmat, int32_t start_node,
   // 6. Apply Local Search
   if (use_local_search && !checklist.empty()) {
     // Intra-Route LS (2-opt)
-    // intra_route_ls(route_out, checklist);
+    intra_route_ls(route_out, checklist);
     // Inter-Route LS
     std::vector<int32_t> pos_ls(n, -1);
     inter_route_ls_optimized(route_out, pos_ls, checklist, in_checklist);
@@ -2094,6 +2304,7 @@ std::tuple<int32_t, bool, float> MFACO_CVRP::select_next_node(
           }
         }
       }
+
     }
 
     if (best_global == -1) {
