@@ -12,17 +12,17 @@ class BasicACO:
     def __init__(self, graph: VrptwGraph, ants_num=10, max_iter=200, beta=2, q0=0.1,
                  whether_or_not_to_show_figure=True):
         super()
-        # Graph node coordinates and service-time information.
+        # graph 结点的位置、服务时间信息
         self.graph = graph
-        # Number of ants.
+        # ants_num 蚂蚁数量
         self.ants_num = ants_num
-        # Maximum number of iterations.
+        # max_iter 最大迭代次数
         self.max_iter = max_iter
-        # Vehicle capacity.
+        # vehicle_capacity 表示每辆车的最大载重
         self.max_load = graph.vehicle_capacity
-        # Importance of heuristic information.
+        # beta 启发性信息重要性
         self.beta = beta
-        # Probability of directly choosing the best next node.
+        # q0 表示直接选择概率最大的下一点的概率
         self.q0 = q0
         # best path
         self.best_path_distance = None
@@ -32,57 +32,57 @@ class BasicACO:
         self.whether_or_not_to_show_figure = whether_or_not_to_show_figure
 
     def run_basic_aco(self):
-        # Run _basic_aco in a worker thread and keep plotting on the main thread.
+        # 开启一个线程来跑_basic_aco，使用主线程来绘图
         path_queue_for_figure = Queue()
         basic_aco_thread = Thread(target=self._basic_aco, args=(path_queue_for_figure,))
         basic_aco_thread.start()
 
-        # Whether to show the figure.
+        # 是否要展示figure
         if self.whether_or_not_to_show_figure:
             figure = VrptwAcoFigure(self.graph.nodes, path_queue_for_figure)
             figure.run()
         basic_aco_thread.join()
 
-        # Send None as the termination marker.
+        # 传入None作为结束标志
         if self.whether_or_not_to_show_figure:
             path_queue_for_figure.put(PathMessage(None, None))
 
     def _basic_aco(self, path_queue_for_figure: Queue):
         """
-        Run the basic ant colony optimization algorithm.
+        最基本的蚁群算法
         :return:
         """
         start_time_total = time.time()
 
-        # Maximum number of iterations.
+        # 最大迭代次数
         start_iteration = 0
         for iter in range(self.max_iter):
 
-            # Create a fresh ant population for this iteration.
+            # 为每只蚂蚁设置当前车辆负载，当前旅行距离，当前时间
             ants = list(Ant(self.graph) for _ in range(self.ants_num))
             for k in range(self.ants_num):
 
-                # Each ant must visit all customers.
+                # 蚂蚁需要访问完所有的客户
                 while not ants[k].index_to_visit_empty():
                     next_index = self.select_next_index(ants[k])
-                    # If the selected next node violates constraints, try one more selection.
+                    # 判断加入该位置后，是否还满足约束条件, 如果不满足，则再选择一次，然后再进行判断
                     if not ants[k].check_condition(next_index):
                         next_index = self.select_next_index(ants[k])
                         if not ants[k].check_condition(next_index):
                             next_index = 0
 
-                    # Update the ant path.
+                    # 更新蚂蚁路径
                     ants[k].move_to_next_index(next_index)
                     self.graph.local_update_pheromone(ants[k].current_index, next_index)
 
-                # Return to the depot at the end.
+                # 最终回到0位置
                 ants[k].move_to_next_index(0)
                 self.graph.local_update_pheromone(ants[k].current_index, 0)
 
-            # Collect completed path distances for best-ant selection.
+            # 计算所有蚂蚁的路径长度
             paths_distance = np.array([ant.total_travel_distance for ant in ants])
 
-            # Select the ant with the shortest route in this iteration.
+            # 记录当前的最佳路径
             best_index = np.argmin(paths_distance)
             if self.best_path is None or paths_distance[best_index] < self.best_path_distance:
                 self.best_path = ants[int(best_index)].travel_path
@@ -90,7 +90,7 @@ class BasicACO:
                 self.best_vehicle_num = self.best_path.count(0) - 1
                 start_iteration = iter
 
-                # Publish improved paths to the plotting thread when enabled.
+                # 图形化展示
                 if self.whether_or_not_to_show_figure:
                     path_queue_for_figure.put(PathMessage(self.best_path, self.best_path_distance))
 
@@ -98,7 +98,7 @@ class BasicACO:
                 print('[iteration %d]: find a improved path, its distance is %f' % (iter, self.best_path_distance))
                 print('it takes %0.3f second multiple_ant_colony_system running' % (time.time() - start_time_total))
 
-            # Reinforce pheromone on the best path after each iteration.
+            # 更新信息素表
             self.graph.global_update_pheromone(self.best_path, self.best_path_distance)
 
             given_iteration = 100
@@ -113,7 +113,7 @@ class BasicACO:
 
     def select_next_index(self, ant):
         """
-        Sample one candidate according to the transition probabilities.
+        选择下一个结点
         :param ant:
         :return:
         """
@@ -128,14 +128,14 @@ class BasicACO:
             max_prob_index = np.argmax(transition_prob)
             next_index = index_to_visit[max_prob_index]
         else:
-            # Otherwise sample the next customer using roulette-wheel selection.
+            # 使用轮盘赌算法
             next_index = BasicACO.stochastic_accept(index_to_visit, transition_prob)
         return next_index
 
     @staticmethod
     def stochastic_accept(index_to_visit, transition_prob):
         """
-        Sample one candidate using roulette-wheel selection.
+        轮盘赌
         :param index_to_visit: a list of N index (list or tuple)
         :param transition_prob:
         :return: selected index

@@ -24,7 +24,7 @@ class Ant:
         self.index_to_visit.clear()
 
     def move_to_next_index(self, next_index):
-        # Update the ant travel path.
+        # 更新蚂蚁路径
         self.travel_path.append(next_index)
         self.total_travel_distance += self.graph.node_dist_mat[self.current_index][next_index]
 
@@ -32,14 +32,14 @@ class Ant:
         self.arrival_time.append(self.vehicle_travel_time + dist)
 
         if self.graph.nodes[next_index].is_depot:
-            # If the next location is the depot, reset vehicle state.
+            # 如果一下个位置为服务器点，则要将车辆负载等清空
             self.vehicle_load = 0
             self.vehicle_travel_time = 0
 
         else:
-            # Update vehicle load, travel distance, and time.
+            # 更新车辆负载、行驶距离、时间
             self.vehicle_load += self.graph.nodes[next_index].demand
-            # Wait when arriving before the customer ready time.
+            # 如果早于客户要求的时间窗(ready_time)，则需要等待
 
             self.vehicle_travel_time += dist + max(self.graph.nodes[next_index].ready_time - self.vehicle_travel_time - dist, 0) + self.graph.nodes[next_index].service_time
             self.index_to_visit.remove(next_index)
@@ -54,7 +54,7 @@ class Ant:
 
     def check_condition(self, next_index) -> bool:
         """
-        Check whether moving to the next node satisfies all constraints.
+        检查移动到下一个点是否满足约束条件
         :param next_index:
         :return:
         """
@@ -65,11 +65,11 @@ class Ant:
         wait_time = max(self.graph.nodes[next_index].ready_time - self.vehicle_travel_time - dist, 0)
         service_time = self.graph.nodes[next_index].service_time
 
-        # Check whether the vehicle can return to the depot after visiting this customer.
+        # 检查访问某一个旅客之后，能否回到服务店
         if self.vehicle_travel_time + dist + wait_time + service_time + self.graph.node_dist_mat[next_index][0] > self.graph.nodes[0].due_time:
             return False
 
-        # Customers cannot be served after their due time.
+        # 不可以服务due time之外的旅客
         if self.vehicle_travel_time + dist > self.graph.nodes[next_index].due_time:
             return False
 
@@ -77,7 +77,7 @@ class Ant:
 
     def cal_next_index_meet_constrains(self):
         """
-        Find all customers reachable from the current ant position.
+        找出所有从当前位置（ant.current_index）可达的customer
         :return:
         """
         next_index_meet_constrains = []
@@ -88,7 +88,7 @@ class Ant:
 
     def cal_nearest_next_index(self, next_index_list):
         """
-        Select the nearest customer from the candidate customers.
+        从待选的customers中选择，离当前位置（ant.current_index）最近的customer
 
         :param next_index_list:
         :return:
@@ -117,9 +117,9 @@ class Ant:
 
     def try_insert_on_path(self, node_id, stop_event: Event):
         """
-        Try inserting node_id into the current travel_path.
-        The insertion position must not violate capacity or time-window constraints.
-        If insertion succeeds, update travel_path and return True.
+        尝试性地将node_id插入当前的travel_path中
+        插入的位置不能违反载重，时间，行驶距离的限制
+        如果有多个位置，则找出最优的位置
         :param node_id:
         :return:
         """
@@ -135,26 +135,26 @@ class Ant:
             if self.graph.nodes[self.travel_path[insert_index]].is_depot:
                 continue
 
-            # Locate the depot that starts the route containing insert_index.
+            # 找出insert_index的前面的最近的depot
             front_depot_index = insert_index
             while front_depot_index >= 0 and not self.graph.nodes[self.travel_path[front_depot_index]].is_depot:
                 front_depot_index -= 1
             front_depot_index = max(front_depot_index, 0)
 
-            # Replay the route prefix into a temporary ant to validate insertion feasibility.
+            # check_ant从front_depot_index出发
             check_ant = Ant(self.graph, self.travel_path[front_depot_index])
 
-            # Reconstruct load and time state up to the insertion position.
+            # 让check_ant 走过 path中下标从front_depot_index开始到insert_index-1的点
             for i in range(front_depot_index+1, insert_index):
                 check_ant.move_to_next_index(self.travel_path[i])
 
-            # Insert the candidate only if it remains feasible at this position.
+            # 开始尝试性地对排序后的index_to_visit中的结点进行访问
             if check_ant.check_condition(node_id):
                 check_ant.move_to_next_index(node_id)
             else:
                 continue
 
-            # Replay the route suffix to ensure downstream customers remain feasible.
+            # 如果可以到node_id，则要保证vehicle可以行驶回到depot
             for next_ind in self.travel_path[insert_index:]:
 
                 if stop_event.is_set():
@@ -164,7 +164,7 @@ class Ant:
                 if check_ant.check_condition(next_ind):
                     check_ant.move_to_next_index(next_ind)
 
-                    # A depot marks a complete feasible route after insertion.
+                    # 如果回到了depot
                     if self.graph.nodes[next_ind].is_depot:
                         temp_front_index = self.travel_path[insert_index-1]
                         temp_back_index = self.travel_path[insert_index]
@@ -177,7 +177,7 @@ class Ant:
                             best_insert_index = insert_index
                         break
 
-                # Stop checking this insertion point as soon as the suffix becomes infeasible.
+                # 如果不可以回到depot，则返回上一层
                 else:
                     break
 
@@ -185,22 +185,22 @@ class Ant:
 
     def insertion_procedure(self, stop_even: Event):
         """
-        Insert any unvisited customers into the existing route when feasible.
-        Customers are tried from largest to smallest demand to repair hard insertions first.
+        为每个未访问的结点尝试性地找到一个合适的位置，插入到当前的travel_path
+        插入的位置不能违反载重，时间，行驶距离的限制
         :return:
         """
         if self.index_to_visit_empty():
             return
 
         success_to_insert = True
-        # No feasible insertion position was found for this node.
+        # 直到未访问的结点中没有一个结点可以插入成功
         while success_to_insert:
 
             success_to_insert = False
-            # Work on a copy so unsuccessful insertion attempts do not mutate the visit list.
+            # 获取未访问的结点
             ind_to_visit = np.array(copy.deepcopy(self.index_to_visit))
 
-            # Sort unvisited customers by demand descending before insertion attempts.
+            # 获取为访问客户点的demand，降序排序
             demand = np.zeros(len(ind_to_visit))
             for i, ind in zip(range(len(ind_to_visit)), ind_to_visit):
                 demand[i] = self.graph.nodes[ind].demand
@@ -230,13 +230,13 @@ class Ant:
     @staticmethod
     def local_search_once(graph: VrptwGraph, travel_path: list, travel_distance: float, i_start, stop_event: Event):
 
-        # Record depot positions so route segments can be validated independently.
+        # 找出path中所有的depot的位置
         depot_ind = []
         for ind in range(len(travel_path)):
             if graph.nodes[travel_path[ind]].is_depot:
                 depot_ind.append(ind)
 
-        # Try exchanging short segments between pairs of routes.
+        # 将self.travel_path分成多段，每段以depot开始，以depot结束，称为route
         for i in range(i_start, len(depot_ind)):
             for j in range(i + 1, len(depot_ind)):
 
@@ -262,7 +262,7 @@ class Ant:
                                 if not graph.nodes[new_path[depot_before_start_b]].is_depot:
                                     raise RuntimeError('error')
 
-                                # Validate the first affected route after the segment exchange.
+                                # 判断发生改变的route a是否是feasible的
                                 success_route_a = False
                                 check_ant = Ant(graph, new_path[depot_before_start_a])
                                 for ind in new_path[depot_before_start_a + 1:]:
@@ -277,7 +277,7 @@ class Ant:
                                 check_ant.clear()
                                 del check_ant
 
-                                # Validate the second affected route after the segment exchange.
+                                # 判断发生改变的route b是否是feasible的
                                 success_route_b = False
                                 check_ant = Ant(graph, new_path[depot_before_start_b])
                                 for ind in new_path[depot_before_start_b + 1:]:
@@ -296,7 +296,7 @@ class Ant:
                                     if new_path_distance < travel_distance:
                                         # print('success to search')
 
-                                        # Find the first route changed by the accepted exchange.
+                                        # 删除路径中连在一起的depot中的一个
                                         for temp_ind in range(1, len(new_path)):
                                             if graph.nodes[new_path[temp_ind]].is_depot and graph.nodes[new_path[temp_ind - 1]].is_depot:
                                                 new_path.pop(temp_ind)
@@ -309,7 +309,7 @@ class Ant:
 
     def local_search_procedure(self, stop_event: Event):
         """
-        Search for one improving inter-route segment exchange.
+        对当前的已经访问完graph中所有节点的travel_path使用cross进行局部搜索
         :return:
         """
         new_path = copy.deepcopy(self.travel_path)
@@ -326,7 +326,7 @@ class Ant:
                 new_path = temp_path
                 new_path_distance = temp_distance
 
-                # Continue local search from the first route touched by the previous improvement.
+                # 设置i_start
                 i_start = (i_start + 1) % (new_path.count(0)-1)
                 i_start = max(i_start, 1)
             else:

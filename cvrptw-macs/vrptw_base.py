@@ -23,33 +23,33 @@ class Node:
 class VrptwGraph:
     def __init__(self, file_path, rho=0.1):
         super()
-        # Number of nodes.
-        # Distance matrix between nodes.
-        # Pheromone intensity on arcs between nodes.
+        # node_num 结点个数
+        # node_dist_mat 节点之间的距离（矩阵）
+        # pheromone_mat 节点之间路径上的信息度浓度
         self.node_num, self.nodes, self.node_dist_mat, self.vehicle_num, self.vehicle_capacity \
             = self.create_from_file(file_path)
-        # Pheromone evaporation rate.
+        # rho 信息素挥发速度
         self.rho = rho
-        # Create the pheromone matrix.
+        # 创建信息素矩阵
 
         self.nnh_travel_path, self.init_pheromone_val, _ = self.nearest_neighbor_heuristic()
         self.init_pheromone_val = 1/(self.init_pheromone_val * self.node_num)
 
         self.pheromone_mat = np.ones((self.node_num, self.node_num)) * self.init_pheromone_val
-        # Heuristic information matrix.
+        # 启发式信息矩阵
         self.heuristic_info_mat = 1 / self.node_dist_mat
 
     def copy(self, init_pheromone_val):
         new_graph = copy.deepcopy(self)
 
-        # Pheromone state.
+        # 信息素
         new_graph.init_pheromone_val = init_pheromone_val
         new_graph.pheromone_mat = np.ones((new_graph.node_num, new_graph.node_num)) * init_pheromone_val
 
         return new_graph
 
     def create_from_file(self, file_path):
-        # Read depot and customer locations from file.
+        # 从文件中读取服务点、客户的位置
         node_list = []
         with open(file_path, 'rt') as f:
             count = 1
@@ -64,7 +64,7 @@ class VrptwGraph:
         node_num = len(node_list)
         nodes = list(Node(int(item[0]), float(item[1]), float(item[2]), float(item[3]), float(item[4]), float(item[5]), float(item[6])) for item in node_list)
 
-        # Create the distance matrix.
+        # 创建距离矩阵
         node_dist_mat = np.zeros((node_num, node_num))
         for i in range(node_num):
             node_a = nodes[i]
@@ -86,7 +86,7 @@ class VrptwGraph:
 
     def global_update_pheromone(self, best_path, best_path_distance):
         """
-        Update the pheromone matrix.
+        更新信息素矩阵
         :return:
         """
         self.pheromone_mat = (1-self.rho) * self.pheromone_mat
@@ -132,7 +132,7 @@ class VrptwGraph:
                 travel_distance += self.node_dist_mat[current_index][nearest_next_index]
                 travel_path.append(nearest_next_index)
                 current_index = nearest_next_index
-        # Track the nearest feasible customer found so far.
+        # 最后要回到depot
         travel_distance += self.node_dist_mat[current_index][0]
         travel_path.append(0)
 
@@ -141,7 +141,7 @@ class VrptwGraph:
 
     def _cal_nearest_next_index(self, index_to_visit, current_index, current_load, current_time):
         """
-        Find the nearest customer that satisfies capacity and time-window constraints.
+        找到最近的可达的next_index
         :param index_to_visit:
         :return:
         """
@@ -155,11 +155,11 @@ class VrptwGraph:
             dist = self.node_dist_mat[current_index][next_index]
             wait_time = max(self.nodes[next_index].ready_time - current_time - dist, 0)
             service_time = self.nodes[next_index].service_time
-            # Check whether the vehicle can return to the depot after visiting this customer.
+            # 检查访问某一个旅客之后，能否回到服务店
             if current_time + dist + wait_time + service_time + self.node_dist_mat[next_index][0] > self.nodes[0].due_time:
                 continue
 
-            # Customers cannot be served after their due time.
+            # 不可以服务due time之外的旅客
             if current_time + dist > self.nodes[next_index].due_time:
                 continue
 
