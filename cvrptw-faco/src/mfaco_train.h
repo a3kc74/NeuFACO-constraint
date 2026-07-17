@@ -358,6 +358,9 @@ private:
 
   float intra_route_ls(std::vector<int32_t> &route,
                        std::vector<int32_t> &checklist);
+  float intra_route_oropt(std::vector<int32_t> &route,
+                          std::vector<int32_t> &checklist,
+                          int32_t segment_len);
 
   float inter_route_ls_optimized(std::vector<int32_t> &perm,
                                  std::vector<int32_t> &positions,

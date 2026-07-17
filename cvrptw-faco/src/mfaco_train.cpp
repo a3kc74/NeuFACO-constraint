@@ -1224,6 +1224,183 @@ float MFACO_CVRP::intra_route_ls(std::vector<int32_t> &route,
   return total_improvement;
 }
 
+float MFACO_CVRP::intra_route_oropt(std::vector<int32_t> &route,
+                                    std::vector<int32_t> &checklist,
+                                    int32_t segment_len) {
+  if (segment_len < 1 || segment_len > 3)
+    return 0.0f;
+
+  float total_improvement = 0.0f;
+  std::vector<int32_t> node_route(n, -1);
+  std::vector<std::vector<int32_t>> routes;
+  std::vector<int32_t> current;
+
+  for (size_t i = 0; i < route.size(); ++i) {
+    int32_t node = route[i];
+    if (node == 0) {
+      if (!current.empty()) {
+        int32_t route_idx = (int32_t)routes.size();
+        for (int32_t c : current) {
+          node_route[c] = route_idx;
+        }
+        routes.push_back(current);
+        current.clear();
+      }
+    } else {
+      current.push_back(node);
+    }
+  }
+
+  if (routes.empty())
+    return 0.0f;
+
+  auto sequence_feasible = [&](const std::vector<int32_t> &seq) -> bool {
+    int64_t route_load = 0;
+    float route_time = 0.0f;
+    int32_t prev = 0;
+
+    for (int32_t node : seq) {
+      if (node <= 0 || node >= n)
+        return false;
+      route_load += demand_int[node];
+      if (route_load > capacity_int)
+        return false;
+      if (has_time_windows) {
+        float arrival = route_time + dist(prev, node);
+        if (arrival > due_time[node] + 1e-6f)
+          return false;
+        route_time = std::max(arrival, ready_time[node]);
+        if (route_time + dist(node, 0) > due_time[0] + 1e-6f)
+          return false;
+      }
+      prev = node;
+    }
+
+    if (has_time_windows)
+      return route_time + dist(prev, 0) <= due_time[0] + 1e-6f;
+    return true;
+  };
+
+  std::vector<int32_t> pos_in_route(n, -1);
+  for (size_t r = 0; r < routes.size(); ++r) {
+    for (size_t i = 0; i < routes[r].size(); ++i) {
+      pos_in_route[routes[r][i]] = (int32_t)i;
+    }
+  }
+
+  std::vector<uint8_t> in_checklist_local(n, 0);
+  for (int32_t node : checklist) {
+    if (node > 0 && node < n) {
+      in_checklist_local[node] = 1;
+    }
+  }
+
+  size_t checklist_pos = 0;
+  while (checklist_pos < checklist.size()) {
+    int32_t a = checklist[checklist_pos++];
+    if (a <= 0 || a >= n)
+      continue;
+
+    int32_t r = node_route[a];
+    if (r < 0 || r >= (int32_t)routes.size())
+      continue;
+
+    auto &seq = routes[r];
+    int32_t size = (int32_t)seq.size();
+    if (size <= segment_len)
+      continue;
+
+    int32_t start_pos = pos_in_route[a];
+    if (start_pos < 0 || start_pos + segment_len > size)
+      continue;
+
+    int32_t end_pos = start_pos + segment_len - 1;
+    int32_t seg_first = seq[start_pos];
+    int32_t seg_last = seq[end_pos];
+    int32_t prev_seg = (start_pos > 0) ? seq[start_pos - 1] : 0;
+    int32_t next_seg = (end_pos < size - 1) ? seq[end_pos + 1] : 0;
+
+    float max_diff = 0.0f;
+    int32_t best_insert_pos = -1;
+
+    for (int32_t jj = 0; jj < k; ++jj) {
+      int32_t b = nn_list[a * k + jj];
+      if (b <= 0 || b >= n)
+        continue;
+      if (node_route[b] != r)
+        continue;
+
+      int32_t b_pos = pos_in_route[b];
+      if (b_pos < 0)
+        continue;
+      if (b_pos >= start_pos - 1 && b_pos <= end_pos)
+        continue;
+
+      int32_t b_next = (b_pos < size - 1) ? seq[b_pos + 1] : 0;
+      float d_old = dist(prev_seg, seg_first) + dist(seg_last, next_seg) +
+                    dist(b, b_next);
+      float d_new = dist(prev_seg, next_seg) + dist(b, seg_first) +
+                    dist(seg_last, b_next);
+      float diff = d_old - d_new;
+      if (diff > max_diff) {
+        max_diff = diff;
+        best_insert_pos = b_pos;
+      }
+    }
+
+    if (max_diff > 1e-6f && best_insert_pos >= 0) {
+      std::vector<int32_t> original_seq = seq;
+      std::vector<int32_t> segment(seq.begin() + start_pos,
+                                   seq.begin() + start_pos + segment_len);
+      seq.erase(seq.begin() + start_pos,
+                seq.begin() + start_pos + segment_len);
+      int32_t adjusted_insert_pos = best_insert_pos;
+      if (best_insert_pos > start_pos)
+        adjusted_insert_pos -= segment_len;
+      seq.insert(seq.begin() + adjusted_insert_pos + 1, segment.begin(),
+                 segment.end());
+
+      if (!sequence_feasible(seq)) {
+        seq.swap(original_seq);
+        continue;
+      }
+
+      total_improvement += max_diff;
+
+      for (int32_t i = 0; i < size; ++i) {
+        pos_in_route[seq[i]] = i;
+      }
+
+      if (extend_ls) {
+        int32_t changed_begin = std::min(start_pos, adjusted_insert_pos + 1);
+        int32_t changed_end = std::max(start_pos + segment_len,
+                                       adjusted_insert_pos + 1 + segment_len);
+        changed_begin = std::max(0, changed_begin - 1);
+        changed_end = std::min(size, changed_end + 1);
+        for (int32_t i = changed_begin; i < changed_end; ++i) {
+          int32_t node = seq[i];
+          if (node > 0 && node < n && !in_checklist_local[node]) {
+            checklist.push_back(node);
+            in_checklist_local[node] = 1;
+          }
+        }
+      }
+    }
+  }
+
+  std::vector<int32_t> new_route;
+  new_route.reserve(route.size());
+  for (const auto &seg : routes) {
+    new_route.push_back(0);
+    for (int32_t c : seg) {
+      new_route.push_back(c);
+    }
+  }
+  new_route.push_back(0);
+  route = new_route;
+  return total_improvement;
+}
+
 // ============================================================================
 // Optimized Inter-Route Local Search (Linked List + DLB + O(1) Delta)
 // ============================================================================
@@ -2109,11 +2286,19 @@ float MFACO_CVRP::sample_ant_direct(const float *probmat, int32_t start_node,
 
   // 6. Apply Local Search
   if (use_local_search && !checklist.empty()) {
+    // Intra-Route Or-opt (1/2/3)
+    intra_route_oropt(route_out, checklist, 1);
+    intra_route_oropt(route_out, checklist, 2);
+    intra_route_oropt(route_out, checklist, 3);
     // Intra-Route LS (2-opt)
     intra_route_ls(route_out, checklist);
     // Inter-Route LS
     std::vector<int32_t> pos_ls(n, -1);
     inter_route_ls_optimized(route_out, pos_ls, checklist, in_checklist);
+    // Intra-Route Or-opt (1/2/3)
+    intra_route_oropt(route_out, checklist, 1);
+    intra_route_oropt(route_out, checklist, 2);
+    intra_route_oropt(route_out, checklist, 3);
     // Intra-Route LS (2-opt)
     intra_route_ls(route_out, checklist);
   }
@@ -2710,11 +2895,19 @@ float MFACO_CVRP::sample_ant_direct_traced(
     std::vector<int32_t> route_before_ls;
     if (has_time_windows)
       route_before_ls = route_out;
+    // Intra-Route Or-opt (1/2/3)
+    intra_route_oropt(route_out, checklist, 1);
+    intra_route_oropt(route_out, checklist, 2);
+    intra_route_oropt(route_out, checklist, 3);
     // Intra-Route LS (2-opt)
     intra_route_ls(route_out, checklist);
     // Inter-Route LS
     std::vector<int32_t> pos_ls(n, -1);
     inter_route_ls_optimized(route_out, pos_ls, checklist, in_checklist);
+    // Intra-Route Or-opt (1/2/3)
+    intra_route_oropt(route_out, checklist, 1);
+    intra_route_oropt(route_out, checklist, 2);
+    intra_route_oropt(route_out, checklist, 3);
     // Intra-Route LS (2-opt)
     intra_route_ls(route_out, checklist);
     if (has_time_windows && !route_fully_feasible(route_out))
