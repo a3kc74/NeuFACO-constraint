@@ -5,7 +5,11 @@ import io
 import os
 import random
 import sys
+import tempfile
 import time
+from multiprocessing import Process
+from multiprocessing import Queue as MPQueue
+from queue import Empty
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +21,46 @@ if str(THIS_DIR) not in sys.path:
 
 from multiple_ant_colony_system import MultipleAntColonySystem
 from vrptw_base import Node, VrptwGraph
+
+
+class LiveMacsAnnouncementStream:
+    def __init__(self, announcement_queue):
+        self.announcement_queue = announcement_queue
+        self._buffer = ""
+        self._emit_next_timing_line = False
+
+    def write(self, text):
+        self._buffer += text
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            self._handle_line(line.rstrip("\r"))
+
+    def flush(self):
+        return None
+
+    def _handle_line(self, line):
+        if "vehicle num of found path" in line:
+            self.announcement_queue.put(line)
+            self._emit_next_timing_line = True
+        elif self._emit_next_timing_line and line.startswith("it takes "):
+            self.announcement_queue.put(line)
+            self._emit_next_timing_line = False
+        elif line:
+            self._emit_next_timing_line = False
+
+
+def _run_macs_worker(input_file, ants, beta, q0, log_file, quiet, announcement_queue=None):
+    graph = VrptwGraph(input_file)
+    macs = MultipleAntColonySystem(
+        graph,
+        ants_num=ants,
+        beta=beta,
+        q0=q0,
+        whether_or_not_to_show_figure=False,
+    )
+    stream = LiveMacsAnnouncementStream(announcement_queue) if quiet and announcement_queue is not None else sys.stdout
+    with contextlib.redirect_stdout(stream):
+        macs._multiple_ant_colony_system(MPQueue(), log_file)
 
 
 def dataset_mode_prefix(tam=False, vrptw=False):
@@ -44,6 +88,93 @@ def load_gfacs_test_dataset(n_nodes, data_dir=None, tam=False, vrptw=False, map_
     if not filename.is_file():
         raise FileNotFoundError(f"File {filename} not found. Generate it with cvrptw-gfacs/utils.py first.")
     return torch.load(filename, map_location=map_location)
+
+def write_macs_input_file(instance, file_path, vehicle_num=None, capacity=1, service_time=0.0):
+    instance = torch.as_tensor(instance, dtype=torch.double).cpu()
+    node_num = int(instance.shape[1])
+    demands = instance[0].numpy()
+    positions = instance[1:3].T.numpy()
+    windows = instance[-2:].T.numpy()
+    vehicle_num = node_num if vehicle_num is None else int(vehicle_num)
+    file_path = Path(file_path)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines = [
+        "GFACS_CONVERTED\n",
+        "\n",
+        "VEHICLE\n",
+        "NUMBER     CAPACITY\n",
+        f"{vehicle_num} {int(capacity)}\n",
+        "\n",
+        "CUSTOMER\n",
+        "CUST NO.  XCOORD.  YCOORD.  DEMAND  READY TIME  DUE DATE  SERVICE TIME\n",
+        "\n",
+    ]
+    for index in range(node_num):
+        lines.append(
+            f"{index} {positions[index, 0]:.12f} {positions[index, 1]:.12f} "
+            f"{demands[index]:.12f} {windows[index, 0]:.12f} {windows[index, 1]:.12f} "
+            f"{float(service_time):.12f}\n"
+        )
+
+    file_path.write_text("".join(lines))
+    return file_path
+
+def read_best_from_macs_log(log_file, default_path, default_cost, default_vehicles):
+    best_path = default_path
+    best_cost = float(default_cost)
+    best_vehicles = int(default_vehicles)
+    log_file = Path(log_file)
+    if not log_file.is_file():
+        return best_path, best_cost, best_vehicles
+
+    for line in log_file.read_text(errors="replace").splitlines():
+        if "distance of found path" in line:
+            try:
+                best_cost = float(line.split("(", 1)[1].split(")", 1)[0])
+            except (IndexError, ValueError):
+                pass
+        elif "vehicle num of found path" in line:
+            try:
+                best_vehicles = int(line.split("(", 1)[1].split(")", 1)[0])
+                best_cost = float(line.rsplit(" ", 1)[1])
+            except (IndexError, ValueError):
+                pass
+        elif line.startswith("best path distance is"):
+            try:
+                cost_part, vehicle_part = line.replace("best path distance is", "", 1).split(", best vehicle_num is")
+                best_cost = float(cost_part.strip())
+                best_vehicles = int(vehicle_part.strip())
+            except ValueError:
+                pass
+
+    return best_path, best_cost, best_vehicles
+
+def extract_quiet_announcements(log_file):
+    announcements = []
+    log_file = Path(log_file)
+    if not log_file.is_file():
+        return announcements
+
+    lines = log_file.read_text(errors="replace").splitlines()
+    for index, line in enumerate(lines):
+        if "vehicle num of found path" not in line:
+            continue
+        announcements.append(line)
+        if index + 1 < len(lines) and lines[index + 1].startswith("it takes "):
+            announcements.append(lines[index + 1])
+    return announcements
+
+def print_quiet_announcements(log_file):
+    for line in extract_quiet_announcements(log_file):
+        print(line, file=sys.__stdout__, flush=True)
+
+def drain_live_announcements(announcement_queue):
+    while True:
+        try:
+            print(announcement_queue.get_nowait(), file=sys.__stdout__, flush=True)
+        except Empty:
+            break
 
 
 def graph_from_gfacs_instance(instance, capacity=1.0, service_time=0.0, rho=0.1):
@@ -88,23 +219,34 @@ def run_instance(instance, ants=10, beta=1, q0=0.1, time_limit=600.0, seed=0, qu
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    graph = graph_from_gfacs_instance(instance)
-    macs = MultipleAntColonySystem(
-        graph,
-        ants_num=ants,
-        beta=beta,
-        q0=q0,
-        whether_or_not_to_show_figure=False,
-    )
+    with tempfile.TemporaryDirectory(prefix="macs-input-") as temp_dir:
+        input_file = write_macs_input_file(instance, Path(temp_dir) / "instance.txt")
+        graph = VrptwGraph(input_file)
+        initial_path, initial_cost, initial_vehicles = graph.nearest_neighbor_heuristic()
 
-    started = time.time()
-    stream = io.StringIO() if quiet else sys.stdout
-    with contextlib.redirect_stdout(stream):
-        path, cost, vehicles = macs.run_multiple_ant_colony_system(
-            time_limit_seconds=time_limit,
-            use_process=False,
-        )
-    elapsed = time.time() - started
+        started = time.time()
+        if time_limit <= 0:
+            path, cost, vehicles = initial_path, initial_cost, initial_vehicles
+        else:
+            log_file = Path(temp_dir) / "macs.log"
+            announcement_queue = MPQueue() if quiet else None
+            process = Process(
+                target=_run_macs_worker,
+                args=(str(input_file), ants, beta, q0, str(log_file), quiet, announcement_queue),
+            )
+            process.start()
+            deadline = time.time() + float(time_limit)
+            while process.is_alive() and time.time() < deadline:
+                if announcement_queue is not None:
+                    drain_live_announcements(announcement_queue)
+                process.join(0.1)
+            if process.is_alive():
+                process.terminate()
+                process.join()
+            if announcement_queue is not None:
+                drain_live_announcements(announcement_queue)
+            path, cost, vehicles = read_best_from_macs_log(log_file, initial_path, initial_cost, initial_vehicles)
+        elapsed = time.time() - started
     return {
         "path": path,
         "cost": float(cost),
