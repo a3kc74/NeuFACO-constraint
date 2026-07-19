@@ -310,6 +310,19 @@ public:
     solver->update_pheromone(route_vec, best_cost);
   }
 
+  bool set_source_route(
+      py::array_t<int32_t, py::array::c_style | py::array::forcecast> route,
+      float cost) {
+    auto buf = route.request();
+    if (buf.ndim != 1) {
+      throw std::runtime_error("route must be 1D");
+    }
+    const int32_t *p = (const int32_t *)buf.ptr;
+    std::vector<int32_t> route_vec(p, p + buf.shape[0]);
+    py::gil_scoped_release release;
+    return solver->set_source_route(route_vec, cost);
+  }
+
   void reset_timings() { solver->reset_timings(); }
   py::dict get_timings() {
     py::dict d;
@@ -427,6 +440,7 @@ PYBIND11_MODULE(faco_opt, m) {
            py::arg("return_decoded") = false)
       .def("update_pheromone_from_route",
            &PyMFACO_CVRP::update_pheromone_from_route)
+      .def("set_source_route", &PyMFACO_CVRP::set_source_route)
       .def_property(
           "use_relocate",
           [](PyMFACO_CVRP &self) { return self.solver->use_relocate; },
@@ -481,6 +495,7 @@ PYBIND11_MODULE(faco_opt, m) {
            py::arg("return_decoded") = false)
       .def("update_pheromone_from_route",
            &PyMFACO_CVRPTW::update_pheromone_from_route)
+      .def("set_source_route", &PyMFACO_CVRPTW::set_source_route)
       .def_property(
           "use_relocate",
           [](PyMFACO_CVRPTW &self) { return self.solver->use_relocate; },

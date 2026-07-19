@@ -208,6 +208,11 @@ class MFACO_CVRP:
         self._cpp.update_pheromone_from_route(p, float(best_cost))
         if self._enable_torch_sync:
             self.sync_pheromone_to_torch()
+
+    def set_source_route(self, route, cost: float) -> bool:
+        """Set the construction source route without changing pheromone."""
+        p = _as_numpy_i32(route)
+        return bool(self._cpp.set_source_route(p, float(cost)))
     
     def _update_pheromone_from_flat(self, best_flat, best_cost: float) -> None:
         """Alias for update_pheromone."""

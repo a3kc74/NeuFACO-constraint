@@ -170,6 +170,19 @@ def test_cvrptw_rejects_infeasible_pheromone_update_route():
     np.testing.assert_array_equal(np.asarray(solver.source_route, dtype=np.int32), original_source)
     np.testing.assert_array_equal(np.asarray(solver.best_route, dtype=np.int32), original_best)
 
+def test_cvrptw_set_source_route_does_not_update_pheromone():
+    coords, demand, windows, capacity = gfacs_instance(20)
+    solver = MFACO_CVRPTW(coords, demand, windows, capacity, n_ants=2, use_local_search=False, cand_list_size=8)
+    original_best = np.asarray(solver.best_route, dtype=np.int32).copy()
+    original_pheromone = np.asarray(solver.pheromone_sparse, dtype=np.float32).copy()
+
+    route = original_best.copy()
+    cost = route_distance(coords, route)
+    solver.set_source_route(route, cost)
+
+    np.testing.assert_array_equal(np.asarray(solver.source_route, dtype=np.int32), route)
+    np.testing.assert_allclose(np.asarray(solver.pheromone_sparse, dtype=np.float32), original_pheromone)
+
 def test_cvrptw_validates_windows_shape():
     coords, demand, windows, capacity = gfacs_instance(20)
 

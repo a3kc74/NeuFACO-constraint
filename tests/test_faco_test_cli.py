@@ -2,12 +2,14 @@ import csv
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "cvrptw-faco"))
 
 from faco_test import main
+import faco_test
 
 
 def make_dataset(path: Path, n_nodes: int, n_instances: int, vrptw: bool = False):
@@ -102,6 +104,75 @@ def test_faco_test_supports_mini_iterations(tmp_path):
     with result_csv.open() as f:
         rows = list(csv.DictReader(f))
     assert [row["T"] for row in rows] == ["1", "2"]
+
+def test_faco_test_uses_global_best_source_for_last_mini_iteration(monkeypatch):
+    calls = []
+
+    class FakeSolver:
+        def __init__(self, *args, **kwargs):
+            self.sample_count = 0
+
+        def seed_rng(self, seed):
+            pass
+
+        def sample(self, prior=None):
+            calls.append(("sample", self.sample_count))
+            routes = np.array(
+                [
+                    [0, 1, 0, 2, 0],
+                    [0, 2, 0, 1, 0],
+                ],
+                dtype=np.int32,
+            )
+            if self.sample_count == 0:
+                costs = np.array([10.0, 5.0], dtype=np.float32)
+            else:
+                costs = np.array([7.0, 8.0], dtype=np.float32)
+            self.sample_count += 1
+            return costs, routes, None, None, None, None, None, None, None
+
+        def update_pheromone(self, route, cost):
+            calls.append(("update", tuple(np.asarray(route, dtype=np.int32)), float(cost)))
+
+        def set_source_route(self, route, cost):
+            calls.append(("set_source", tuple(np.asarray(route, dtype=np.int32)), float(cost)))
+
+    monkeypatch.setattr(faco_test, "MFACO_CVRPTW", FakeSolver)
+    demands = torch.tensor([0.0, 0.1, 0.1])
+    positions = torch.zeros((3, 2))
+    windows = torch.tensor([[0.0, 10.0], [0.0, 10.0], [0.0, 10.0]])
+
+    faco_test.infer_instance(
+        demands=demands,
+        positions=positions,
+        windows=windows,
+        n_ants=2,
+        n_iter=1,
+        mini_H=2,
+        threads=None,
+        seed=1,
+        cand_list_size=2,
+        backup_list_size=2,
+        min_new_edges=1,
+        decay=0.9,
+        alpha=1.0,
+        p_best=0.05,
+        use_local_search=False,
+        disable_heuristic=False,
+        extend_ls=False,
+        smooth_mmas=False,
+        fixed_steps=0,
+        nls=False,
+        T_nls=10,
+    )
+
+    assert calls == [
+        ("sample", 0),
+        ("update", (0, 2, 0, 1, 0), 5.0),
+        ("set_source", (0, 2, 0, 1, 0), 5.0),
+        ("sample", 1),
+        ("update", (0, 1, 0, 2, 0), 7.0),
+    ]
 
 def test_faco_test_supports_cpp_thread_count(tmp_path):
     data_dir = tmp_path / "data" / "cvrptw"

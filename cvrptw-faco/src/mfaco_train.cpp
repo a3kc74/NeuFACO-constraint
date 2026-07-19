@@ -915,6 +915,16 @@ void MFACO_CVRP::update_pheromone(const std::vector<int32_t> &best_route_in,
   source_cost = new_best_cost;
 }
 
+bool MFACO_CVRP::set_source_route(const std::vector<int32_t> &route_in,
+                                  float cost_in) {
+  if (!route_fully_feasible(route_in)) {
+    return false;
+  }
+  source_route = route_in;
+  source_cost = cost_in;
+  return true;
+}
+
 // REMOVED two_opt_nn_prior
 
 // -------------------- Inter-route LS --------------------

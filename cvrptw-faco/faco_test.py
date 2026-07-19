@@ -132,11 +132,14 @@ def infer_instance(
     results = torch.zeros(size=(n_iter,), dtype=torch.float32)
     diversities = torch.zeros(size=(n_iter,), dtype=torch.float32)
     best_so_far = float("inf")
-
+    global_best_route = None
+   
     start = time.time()
     for t in range(n_iter):
         routes = None
         for _mini_t in range(mini_H):
+            if _mini_t == mini_H - 1 and global_best_route is not None:
+                solver.set_source_route(global_best_route, best_so_far)
             costs, routes, *_ = solver.sample(prior=None)
             costs_np = np.asarray(costs, dtype=np.float32)
             best_idx = int(np.argmin(costs_np))
@@ -144,6 +147,8 @@ def infer_instance(
             best_route = np.asarray(routes[best_idx], dtype=np.int32)
             if best_cost < best_so_far:
                 best_so_far = best_cost
+                global_best_route = best_route.copy()
+        
             solver.update_pheromone(best_route, best_cost)
         results[t] = best_so_far
         diversities[t] = route_diversity(routes)

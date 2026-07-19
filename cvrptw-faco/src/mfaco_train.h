@@ -282,6 +282,7 @@ public:
   void update_pheromone(const int32_t *best_perm_ptr, float new_best_cost);
   void update_pheromone(const std::vector<int32_t> &best_route_in,
                         float new_best_cost);
+  bool set_source_route(const std::vector<int32_t> &route_in, float cost_in);
 
   // Decode permutation into route-with-zeros (for convenience / debug)
   // perm_ptr length m
