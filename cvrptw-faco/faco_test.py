@@ -22,7 +22,7 @@ if str(CURRENT_DIR) not in sys.path:
 if str(GFACS_DIR) not in sys.path:
     sys.path.insert(0, str(GFACS_DIR))
 
-from faco import MFACO_CVRPTW
+from faco import MFACO_CVRPTW, set_faco_cpp_threads
 
 
 def dataset_mode_prefix(tam: bool = False, vrptw: bool = False) -> str:
@@ -84,6 +84,8 @@ def infer_instance(
     windows,
     n_ants: int,
     n_iter: int,
+    mini_H: int,
+    threads: int | None,
     seed: int,
     cand_list_size: int,
     backup_list_size: int,
@@ -99,6 +101,11 @@ def infer_instance(
     nls: bool,
     T_nls: int,
 ):
+    if mini_H < 1:
+        raise ValueError("mini_H must be >= 1")
+    if threads is not None and threads < 1:
+        raise ValueError("threads must be >= 1")
+
     solver = MFACO_CVRPTW(
         positions,
         demands,
@@ -128,21 +135,23 @@ def infer_instance(
 
     start = time.time()
     for t in range(n_iter):
-        costs, routes, *_ = solver.sample(prior=None)
-        costs_np = np.asarray(costs, dtype=np.float32)
-        best_idx = int(np.argmin(costs_np))
-        best_cost = float(costs_np[best_idx])
-        best_route = np.asarray(routes[best_idx], dtype=np.int32)
-        if best_cost < best_so_far:
-            best_so_far = best_cost
-        solver.update_pheromone(best_route, best_cost)
+        routes = None
+        for _mini_t in range(mini_H):
+            costs, routes, *_ = solver.sample(prior=None)
+            costs_np = np.asarray(costs, dtype=np.float32)
+            best_idx = int(np.argmin(costs_np))
+            best_cost = float(costs_np[best_idx])
+            best_route = np.asarray(routes[best_idx], dtype=np.int32)
+            if best_cost < best_so_far:
+                best_so_far = best_cost
+            solver.update_pheromone(best_route, best_cost)
         results[t] = best_so_far
         diversities[t] = route_diversity(routes)
     elapsed = time.time() - start
     return results, diversities, elapsed
 
 
-def test(dataset, n_ants: int, n_iter: int, seed: int, **solver_kwargs):
+def test(dataset, n_ants: int, n_iter: int, mini_H: int, threads: int | None, seed: int, **solver_kwargs):
     sum_results = torch.zeros(size=(n_iter,), dtype=torch.float32)
     sum_diversities = torch.zeros(size=(n_iter,), dtype=torch.float32)
     sum_times = 0.0
@@ -154,6 +163,8 @@ def test(dataset, n_ants: int, n_iter: int, seed: int, **solver_kwargs):
             windows=windows.cpu(),
             n_ants=n_ants,
             n_iter=n_iter,
+            mini_H=mini_H,
+            threads=threads,
             seed=seed + idx,
             **solver_kwargs,
         )
@@ -172,6 +183,8 @@ def write_results(
     n_instances: int,
     n_ants: int,
     n_iter: int,
+    mini_H: int,
+    threads: int | None,
     seed: int,
     duration: float,
     avg_cost,
@@ -185,6 +198,8 @@ def write_results(
         f.write(f"number of instances: {n_instances}\n")
         f.write("device: cpu\n")
         f.write(f"n_ants: {n_ants}\n")
+        f.write(f"mini_H: {mini_H}\n")
+        f.write(f"threads: {threads if threads is not None else 'default'}\n")
         f.write(f"seed: {seed}\n")
         f.write(f"average inference time: {duration}\n")
         for i in range(n_iter):
@@ -203,6 +218,8 @@ def main(
     size: int | None = None,
     n_ants: int = 100,
     n_iter: int = 10,
+    mini_H: int = 1,
+    threads: int | None = None,
     seed: int = 0,
     tam: bool = False,
     vrptw: bool = False,
@@ -222,6 +239,13 @@ def main(
     nls: bool = False,
     T_nls: int = 10,
 ):
+    if mini_H < 1:
+        raise ValueError("mini_H must be >= 1")
+    if threads is not None and threads < 1:
+        raise ValueError("threads must be >= 1")
+    if threads is not None:
+        set_faco_cpp_threads(threads)
+
     if k_sparse is None:
         k_sparse = n_nodes // 5
     if cand_list_size is None:
@@ -241,12 +265,16 @@ def main(
     print("number of instances:", len(dataset))
     print("device:", "cpu")
     print("n_ants:", n_ants)
+    print("mini_H:", mini_H)
+    print("threads:", threads if threads is not None else "default")
     print("seed:", seed)
 
     avg_cost, avg_diversity, duration = test(
         dataset,
         n_ants=n_ants,
         n_iter=n_iter,
+        mini_H=mini_H,
+        threads=threads,
         seed=seed,
         cand_list_size=cand_list_size,
         backup_list_size=backup_list_size,
@@ -270,7 +298,7 @@ def main(
     out_dir = Path(output_dir) if output_dir is not None else ROOT_DIR / "pretrained" / "cvrptw" / str(n_nodes) / "faco"
     result_filename = (
         f"test_result_ckptnone-{problem_name}{n_nodes}-ninst{size}-"
-        f"nants{n_ants}-niter{n_iter}-seed{seed}-faco"
+        f"nants{n_ants}-niter{n_iter}-miniH{mini_H}-threads{threads if threads is not None else 'default'}-seed{seed}-faco"
     )
     result_txt = out_dir / f"{result_filename}.txt"
     result_csv = out_dir / f"{result_filename}.csv"
@@ -282,6 +310,8 @@ def main(
         n_instances=len(dataset),
         n_ants=n_ants,
         n_iter=n_iter,
+        mini_H=mini_H,
+        threads=threads,
         seed=seed,
         duration=duration,
         avg_cost=avg_cost,
@@ -295,6 +325,8 @@ def parse_args():
     parser.add_argument("nodes", type=int, help="Problem scale")
     parser.add_argument("-k", "--k_sparse", type=int, default=None, help="k_sparse / default FACO candidate list size")
     parser.add_argument("-i", "--n_iter", type=int, default=10, help="Number of FACO iterations")
+    parser.add_argument("--mini_H", type=int, default=1, help="Number of FACO mini-iterations per outer iteration")
+    parser.add_argument("--threads", type=int, default=None, help="OpenMP thread count for parallel C++ FACO sampling/update")
     parser.add_argument("-n", "--n_ants", type=int, default=100, help="Number of ants")
     parser.add_argument("-s", "--size", type=int, default=None, help="Number of instances to test")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
@@ -327,6 +359,8 @@ if __name__ == "__main__":
         size=args.size,
         n_ants=args.n_ants,
         n_iter=args.n_iter,
+        mini_H=args.mini_H,
+        threads=args.threads,
         seed=args.seed,
         tam=args.tam,
         vrptw=args.vrptw,

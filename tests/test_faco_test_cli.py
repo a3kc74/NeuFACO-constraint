@@ -70,3 +70,61 @@ def test_faco_test_outputs_gfacs_format_for_cvrptw(tmp_path):
 
 def test_faco_test_outputs_gfacs_format_for_vrptw(tmp_path):
     run_case(tmp_path, vrptw=True)
+
+def test_faco_test_supports_mini_iterations(tmp_path):
+    data_dir = tmp_path / "data" / "cvrptw"
+    out_dir = tmp_path / "out"
+    data_dir.mkdir(parents=True)
+    make_dataset(data_dir / "testDataset-20.pt", n_nodes=20, n_instances=1)
+
+    avg_cost, avg_diversity, duration, result_txt, result_csv = main(
+        n_nodes=20,
+        k_sparse=4,
+        size=1,
+        n_ants=3,
+        n_iter=2,
+        mini_H=2,
+        seed=5,
+        data_dir=data_dir,
+        output_dir=out_dir,
+        use_local_search=False,
+    )
+
+    assert len(avg_cost) == 2
+    assert len(avg_diversity) == 2
+    assert duration >= 0
+    assert "miniH2" in result_txt.name
+    text = result_txt.read_text()
+    assert "mini_H: 2" in text
+    assert "T=1, avg. cost" in text
+    assert "T=2, avg. cost" in text
+
+    with result_csv.open() as f:
+        rows = list(csv.DictReader(f))
+    assert [row["T"] for row in rows] == ["1", "2"]
+
+def test_faco_test_supports_cpp_thread_count(tmp_path):
+    data_dir = tmp_path / "data" / "cvrptw"
+    out_dir = tmp_path / "out"
+    data_dir.mkdir(parents=True)
+    make_dataset(data_dir / "testDataset-20.pt", n_nodes=20, n_instances=1)
+
+    avg_cost, avg_diversity, duration, result_txt, result_csv = main(
+        n_nodes=20,
+        k_sparse=4,
+        size=1,
+        n_ants=3,
+        n_iter=1,
+        threads=1,
+        seed=5,
+        data_dir=data_dir,
+        output_dir=out_dir,
+        use_local_search=False,
+    )
+
+    assert len(avg_cost) == 1
+    assert len(avg_diversity) == 1
+    assert duration >= 0
+    assert result_csv.exists()
+    assert "threads1" in result_txt.name
+    assert "threads: 1" in result_txt.read_text()
