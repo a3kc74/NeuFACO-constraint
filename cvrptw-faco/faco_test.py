@@ -80,10 +80,23 @@ def route_diversity(routes) -> float:
 def route_edge_distance(route_a, route_b) -> float:
     edges_a = route_edges(route_a)
     edges_b = route_edges(route_b)
+    return edge_set_distance(edges_a, edges_b)
+
+
+def edge_set_distance(edges_a, edges_b) -> float:
     union = edges_a | edges_b
     if not union:
         return 0.0
     return 1.0 - len(edges_a & edges_b) / len(union)
+
+
+def route_entry(route, cost, edges=None):
+    route = np.asarray(route, dtype=np.int32).copy()
+    return {"route": route, "cost": float(cost), "edges": route_edges(route) if edges is None else edges}
+
+
+def normalize_archive_entry(item):
+    return route_entry(item["route"], item["cost"], item.get("edges"))
 
 def update_elite_archive(
     archive,
@@ -97,15 +110,9 @@ def update_elite_archive(
     if elite_k <= 0:
         return []
 
-    candidates = [
-        {"route": np.asarray(item["route"], dtype=np.int32).copy(), "cost": float(item["cost"])}
-        for item in archive
-    ]
+    candidates = [normalize_archive_entry(item) for item in archive]
     if pinned_elite is not None:
-        pinned_elite = {
-            "route": np.asarray(pinned_elite["route"], dtype=np.int32).copy(),
-            "cost": float(pinned_elite["cost"]),
-        }
+        pinned_elite = normalize_archive_entry(pinned_elite)
         candidates.append(pinned_elite)
 
     best_candidate_cost = min([float(item["cost"]) for item in candidates] + [float(np.min(costs))])
@@ -114,7 +121,7 @@ def update_elite_archive(
     for route, cost in zip(routes, costs):
         cost = float(cost)
         if cost <= max_allowed_cost:
-            candidates.append({"route": np.asarray(route, dtype=np.int32).copy(), "cost": cost})
+            candidates.append(route_entry(route, cost))
 
     candidates.sort(key=lambda item: item["cost"])
     diverse = []
@@ -124,7 +131,7 @@ def update_elite_archive(
     for candidate in candidates:
         if any(np.array_equal(candidate["route"], item["route"]) for item in diverse):
             continue
-        if all(route_edge_distance(candidate["route"], item["route"]) >= elite_min_diversity for item in diverse):
+        if all(edge_set_distance(candidate["edges"], item["edges"]) >= elite_min_diversity for item in diverse):
             diverse.append(candidate)
         if len(diverse) >= elite_k:
             break

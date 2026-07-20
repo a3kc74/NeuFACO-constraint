@@ -203,6 +203,31 @@ def test_elite_archive_keeps_top_diverse_routes():
         (0, 3, 2, 0, 1, 0),
     ]
 
+def test_elite_archive_accepts_cached_and_uncached_entries():
+    cached_route = np.array([0, 1, 2, 0, 3, 0], dtype=np.int32)
+    archive = [
+        {
+            "route": cached_route,
+            "cost": 10.0,
+            "edges": faco_test.route_edges(cached_route),
+        },
+        {"route": np.array([0, 1, 3, 0, 2, 0], dtype=np.int32), "cost": 11.0},
+    ]
+    routes = np.array([[0, 3, 2, 0, 1, 0]], dtype=np.int32)
+    costs = np.array([12.0], dtype=np.float32)
+
+    updated = faco_test.update_elite_archive(
+        archive,
+        routes,
+        costs,
+        elite_k=3,
+        elite_min_diversity=0.1,
+        elite_cost_tolerance=1.5,
+    )
+
+    assert all("edges" in item for item in updated)
+    assert [round(item["cost"], 3) for item in updated] == [10.0, 11.0, 12.0]
+
 def test_elite_archive_can_pin_global_best_even_when_not_diverse():
     archive = []
     routes = np.array(
