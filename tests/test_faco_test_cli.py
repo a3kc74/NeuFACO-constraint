@@ -105,7 +105,7 @@ def test_faco_test_supports_mini_iterations(tmp_path):
         rows = list(csv.DictReader(f))
     assert [row["T"] for row in rows] == ["1", "2"]
 
-def test_faco_test_uses_global_best_source_for_last_mini_iteration(monkeypatch):
+def test_faco_test_falls_back_to_global_best_source_for_last_mini_iteration(monkeypatch):
     calls = []
 
     class FakeSolver:
@@ -172,6 +172,152 @@ def test_faco_test_uses_global_best_source_for_last_mini_iteration(monkeypatch):
         ("set_source", (0, 2, 0, 1, 0), 5.0),
         ("sample", 1),
         ("update", (0, 1, 0, 2, 0), 7.0),
+    ]
+
+def test_elite_archive_keeps_top_diverse_routes():
+    archive = []
+    routes = np.array(
+        [
+            [0, 1, 2, 0, 3, 0],
+            [0, 1, 2, 0, 3, 0],
+            [0, 1, 3, 0, 2, 0],
+            [0, 3, 2, 0, 1, 0],
+        ],
+        dtype=np.int32,
+    )
+    costs = np.array([10.0, 9.0, 11.0, 12.0], dtype=np.float32)
+
+    archive = faco_test.update_elite_archive(
+        archive,
+        routes,
+        costs,
+        elite_k=3,
+        elite_min_diversity=0.1,
+        elite_cost_tolerance=1.5,
+    )
+
+    assert [round(item["cost"], 3) for item in archive] == [9.0, 11.0, 12.0]
+    assert [tuple(item["route"].tolist()) for item in archive] == [
+        (0, 1, 2, 0, 3, 0),
+        (0, 1, 3, 0, 2, 0),
+        (0, 3, 2, 0, 1, 0),
+    ]
+
+def test_elite_archive_can_pin_global_best_even_when_not_diverse():
+    archive = []
+    routes = np.array(
+        [
+            [0, 1, 3, 0, 2, 0],
+            [0, 3, 2, 0, 1, 0],
+        ],
+        dtype=np.int32,
+    )
+    costs = np.array([11.0, 12.0], dtype=np.float32)
+    global_best = {"route": np.array([0, 1, 2, 0, 3, 0], dtype=np.int32), "cost": 10.0}
+
+    archive = faco_test.update_elite_archive(
+        archive,
+        routes,
+        costs,
+        elite_k=2,
+        elite_min_diversity=0.95,
+        elite_cost_tolerance=1.5,
+        pinned_elite=global_best,
+    )
+
+    assert tuple(archive[0]["route"].tolist()) == (0, 1, 2, 0, 3, 0)
+    assert archive[0]["cost"] == 10.0
+    assert len(archive) >= 1
+
+def test_faco_test_uses_multisource_sampling_for_last_mini_iteration(monkeypatch):
+    calls = []
+
+    class FakeSolver:
+        def __init__(self, *args, **kwargs):
+            self.sample_count = 0
+
+        def seed_rng(self, seed):
+            pass
+
+        def sample(self, prior=None):
+            calls.append(("sample", self.sample_count))
+            if self.sample_count == 0:
+                routes = np.array(
+                    [
+                        [0, 1, 2, 0, 3, 0],
+                        [0, 1, 3, 0, 2, 0],
+                    ],
+                    dtype=np.int32,
+                )
+                costs = np.array([10.0, 11.0], dtype=np.float32)
+            elif self.sample_count == 1:
+                routes = np.array(
+                    [
+                        [0, 3, 2, 0, 1, 0],
+                        [0, 2, 1, 0, 3, 0],
+                    ],
+                    dtype=np.int32,
+                )
+                costs = np.array([12.0, 13.0], dtype=np.float32)
+            else:
+                routes = np.array(
+                    [
+                        [0, 3, 1, 0, 2, 0],
+                        [0, 2, 3, 0, 1, 0],
+                    ],
+                    dtype=np.int32,
+                )
+                costs = np.array([9.0, 14.0], dtype=np.float32)
+            self.sample_count += 1
+            return costs, routes, None, None, None, None, None, None, None
+
+        def update_pheromone(self, route, cost):
+            calls.append(("update", tuple(np.asarray(route, dtype=np.int32)), float(cost)))
+
+        def set_source_route(self, route, cost):
+            calls.append(("set_source", tuple(np.asarray(route, dtype=np.int32)), float(cost)))
+
+    monkeypatch.setattr(faco_test, "MFACO_CVRPTW", FakeSolver)
+    demands = torch.tensor([0.0, 0.1, 0.1, 0.1])
+    positions = torch.zeros((4, 2))
+    windows = torch.tensor([[0.0, 10.0], [0.0, 10.0], [0.0, 10.0], [0.0, 10.0]])
+
+    faco_test.infer_instance(
+        demands=demands,
+        positions=positions,
+        windows=windows,
+        n_ants=2,
+        n_iter=1,
+        mini_H=2,
+        threads=None,
+        seed=1,
+        cand_list_size=2,
+        backup_list_size=2,
+        min_new_edges=1,
+        decay=0.9,
+        alpha=1.0,
+        p_best=0.05,
+        use_local_search=False,
+        disable_heuristic=False,
+        extend_ls=False,
+        smooth_mmas=False,
+        fixed_steps=0,
+        nls=False,
+        T_nls=10,
+        elite_k=2,
+        elite_min_diversity=0.1,
+        elite_cost_tolerance=1.5,
+        source_count=2,
+    )
+
+    assert calls == [
+        ("sample", 0),
+        ("update", (0, 1, 2, 0, 3, 0), 10.0),
+        ("set_source", (0, 1, 2, 0, 3, 0), 10.0),
+        ("sample", 1),
+        ("set_source", (0, 1, 3, 0, 2, 0), 11.0),
+        ("sample", 2),
+        ("update", (0, 3, 1, 0, 2, 0), 9.0),
     ]
 
 def test_faco_test_supports_cpp_thread_count(tmp_path):

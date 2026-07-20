@@ -77,6 +77,75 @@ def route_diversity(routes) -> float:
         pairs += 1
     return 1.0 - total / pairs if pairs else 0.0
 
+def route_edge_distance(route_a, route_b) -> float:
+    edges_a = route_edges(route_a)
+    edges_b = route_edges(route_b)
+    union = edges_a | edges_b
+    if not union:
+        return 0.0
+    return 1.0 - len(edges_a & edges_b) / len(union)
+
+def update_elite_archive(
+    archive,
+    routes,
+    costs,
+    elite_k: int,
+    elite_min_diversity: float,
+    elite_cost_tolerance: float,
+    pinned_elite=None,
+):
+    if elite_k <= 0:
+        return []
+
+    candidates = [
+        {"route": np.asarray(item["route"], dtype=np.int32).copy(), "cost": float(item["cost"])}
+        for item in archive
+    ]
+    if pinned_elite is not None:
+        pinned_elite = {
+            "route": np.asarray(pinned_elite["route"], dtype=np.int32).copy(),
+            "cost": float(pinned_elite["cost"]),
+        }
+        candidates.append(pinned_elite)
+
+    best_candidate_cost = min([float(item["cost"]) for item in candidates] + [float(np.min(costs))])
+    max_allowed_cost = best_candidate_cost * elite_cost_tolerance
+
+    for route, cost in zip(routes, costs):
+        cost = float(cost)
+        if cost <= max_allowed_cost:
+            candidates.append({"route": np.asarray(route, dtype=np.int32).copy(), "cost": cost})
+
+    candidates.sort(key=lambda item: item["cost"])
+    diverse = []
+    if pinned_elite is not None:
+        diverse.append(pinned_elite)
+
+    for candidate in candidates:
+        if any(np.array_equal(candidate["route"], item["route"]) for item in diverse):
+            continue
+        if all(route_edge_distance(candidate["route"], item["route"]) >= elite_min_diversity for item in diverse):
+            diverse.append(candidate)
+        if len(diverse) >= elite_k:
+            break
+    return diverse
+
+def select_elite_source(archive, step: int):
+    if not archive:
+        return None
+    return archive[(step + 1) % len(archive)]
+
+def sample_multisource(solver, archive, source_count: int):
+    source_count = min(source_count, len(archive))
+    all_costs = []
+    all_routes = []
+    for source in archive[:source_count]:
+        solver.set_source_route(source["route"], source["cost"])
+        costs, routes, *_ = solver.sample(prior=None)
+        all_costs.append(np.asarray(costs, dtype=np.float32))
+        all_routes.extend(np.asarray(route, dtype=np.int32) for route in routes)
+    return np.concatenate(all_costs), np.asarray(all_routes, dtype=object)
+
 
 def infer_instance(
     demands,
@@ -100,6 +169,11 @@ def infer_instance(
     fixed_steps: int,
     nls: bool,
     T_nls: int,
+    elite_k: int = 8,
+    elite_min_diversity: float = 0.15,
+    elite_cost_tolerance: float = 1.05,
+    source_count: int = 2,
+    pin_global_best_elite: bool = False,
 ):
     if mini_H < 1:
         raise ValueError("mini_H must be >= 1")
@@ -133,21 +207,38 @@ def infer_instance(
     diversities = torch.zeros(size=(n_iter,), dtype=torch.float32)
     best_so_far = float("inf")
     global_best_route = None
+    elite_archive = []
    
     start = time.time()
     for t in range(n_iter):
         routes = None
         for _mini_t in range(mini_H):
-            if _mini_t == mini_H - 1 and global_best_route is not None:
-                solver.set_source_route(global_best_route, best_so_far)
-            costs, routes, *_ = solver.sample(prior=None)
-            costs_np = np.asarray(costs, dtype=np.float32)
+            if _mini_t == mini_H - 1 and len(elite_archive) > 1:
+                costs_np, routes = sample_multisource(solver, elite_archive, source_count)
+            else:
+                elite_source = select_elite_source(elite_archive, t) if _mini_t == mini_H - 1 else None
+                if elite_source is not None:
+                    solver.set_source_route(elite_source["route"], elite_source["cost"])
+                elif _mini_t == mini_H - 1 and global_best_route is not None:
+                    solver.set_source_route(global_best_route, best_so_far)
+                costs, routes, *_ = solver.sample(prior=None)
+                costs_np = np.asarray(costs, dtype=np.float32)
             best_idx = int(np.argmin(costs_np))
             best_cost = float(costs_np[best_idx])
             best_route = np.asarray(routes[best_idx], dtype=np.int32)
             if best_cost < best_so_far:
                 best_so_far = best_cost
                 global_best_route = best_route.copy()
+            pinned_elite = {"route": global_best_route, "cost": best_so_far} if pin_global_best_elite and global_best_route is not None else None
+            elite_archive = update_elite_archive(
+                elite_archive,
+                routes,
+                costs_np,
+                elite_k=elite_k,
+                elite_min_diversity=elite_min_diversity,
+                elite_cost_tolerance=elite_cost_tolerance,
+                pinned_elite=pinned_elite,
+            )
         
             solver.update_pheromone(best_route, best_cost)
         results[t] = best_so_far
@@ -243,6 +334,11 @@ def main(
     fixed_steps: int = 0,
     nls: bool = False,
     T_nls: int = 10,
+    elite_k: int = 8,
+    elite_min_diversity: float = 0.15,
+    elite_cost_tolerance: float = 1.05,
+    source_count: int = 2,
+    pin_global_best_elite: bool = False,
 ):
     if mini_H < 1:
         raise ValueError("mini_H must be >= 1")
@@ -254,7 +350,7 @@ def main(
     if k_sparse is None:
         k_sparse = n_nodes // 5
     if cand_list_size is None:
-        cand_list_size = k_sparse
+        cand_list_size = min(k_sparse, 32)
 
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -294,6 +390,11 @@ def main(
         fixed_steps=fixed_steps,
         nls=nls,
         T_nls=T_nls,
+        elite_k=elite_k,
+        elite_min_diversity=elite_min_diversity,
+        elite_cost_tolerance=elite_cost_tolerance,
+        source_count=source_count,
+        pin_global_best_elite=pin_global_best_elite,
     )
 
     print("average inference time: ", duration)
@@ -353,6 +454,11 @@ def parse_args():
     parser.add_argument("--fixed_steps", type=int, default=0, help="Fixed sampler steps; 0 means default")
     parser.add_argument("--nls", action="store_true", help="Enable NLS mode")
     parser.add_argument("--T_nls", type=int, default=10, help="Number of NLS iterations")
+    parser.add_argument("--elite_k", type=int, default=8, help="Number of quality-diverse elite source routes")
+    parser.add_argument("--elite_min_diversity", type=float, default=0.15, help="Minimum edge distance between elite source routes")
+    parser.add_argument("--elite_cost_tolerance", type=float, default=1.05, help="Maximum elite source cost ratio versus current best")
+    parser.add_argument("--source_count", type=int, default=2, help="Number of elite source routes used by final-mini multisource sampling")
+    parser.add_argument("--pin_global_best_elite", action="store_true", help="Always keep global best as one elite archive route")
     return parser.parse_args()
 
 
@@ -384,4 +490,9 @@ if __name__ == "__main__":
         fixed_steps=args.fixed_steps,
         nls=args.nls,
         T_nls=args.T_nls,
+        elite_k=args.elite_k,
+        elite_min_diversity=args.elite_min_diversity,
+        elite_cost_tolerance=args.elite_cost_tolerance,
+        source_count=args.source_count,
+        pin_global_best_elite=args.pin_global_best_elite,
     )
