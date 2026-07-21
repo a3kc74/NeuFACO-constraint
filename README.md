@@ -10,3 +10,5 @@ For the complete list of dependencies, please refer to the `requirements.txt` fi
 
 ## Usage
 For the usage of the code, please refer to each folder's `README.md` file.
+
+uv run setup.py build_ext --inplace    
