@@ -192,6 +192,7 @@ def train_instance_dynaco(
                     ndec_f = ndec.to(dtype=old_logp.dtype).clamp_min(1.0)
                     old_logp = old_logp / ndec_f
                 rollout.append({
+                    'pyg_data': pyg_data.detach().clone(),
                     'tau': tau,
                     'eta': eta,
                     'traces': traces,
@@ -208,12 +209,13 @@ def train_instance_dynaco(
 
         for _ in range(args.ppo_epochs):
             optimizer.zero_grad(set_to_none=True)
-            prior_new = model.reshape(pyg_data, model(pyg_data))
             losses = []
             entropies = []
             approx_kls = []
             clip_fracs = []
             for item in rollout:
+                item_pyg_data = item['pyg_data']
+                prior_new = model.reshape(item_pyg_data, model(item_pyg_data))
                 new_logp, entropy, ndec = replay_logp_from_trace(
                     item['traces'], item['tau'], item['eta'], prior_new,
                     alpha=args.alpha, disable_heuristic=args.disable_heuristic,
