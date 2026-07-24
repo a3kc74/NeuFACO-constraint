@@ -25,15 +25,16 @@ def route_distance(coords, route) -> float:
 
 def generate_cvrptw_instance(n_nodes: int, seed: int | None = None, device=None) -> dict[str, Any]:
     rng = np.random.default_rng(seed)
-    coords = rng.random((n_nodes, 2), dtype=np.float32)
+    total_nodes = int(n_nodes) + 1
+    coords = rng.random((total_nodes, 2), dtype=np.float32)
     coords[0] = np.array([0.5, 0.5], dtype=np.float32)
-    demand = rng.uniform(0.02, 0.12, size=n_nodes).astype(np.float32)
+    demand = rng.uniform(0.02, 0.12, size=total_nodes).astype(np.float32)
     demand[0] = 0.0
     capacity = 1.0
 
     depot_dist = np.linalg.norm(coords - coords[0], axis=1).astype(np.float32)
-    ready = rng.uniform(0.0, 0.45, size=n_nodes).astype(np.float32)
-    width = rng.uniform(0.45, 0.9, size=n_nodes).astype(np.float32)
+    ready = rng.uniform(0.0, 0.45, size=total_nodes).astype(np.float32)
+    width = rng.uniform(0.45, 0.9, size=total_nodes).astype(np.float32)
     due = np.maximum(ready + width, depot_dist * 2.0 + 0.2).astype(np.float32)
     ready[0] = 0.0
     due[0] = max(3.0, float(due.max() + depot_dist.max() + 1.0))
@@ -135,16 +136,18 @@ def gen_pyg_data(
     min_new_edges: int = 8,
     device: str | torch.device | None = None,
     return_solver: bool = False,
+    solver: MFACO_CVRPTW | None = None,
 ):
     instance = normalize_instance(instance, device=device)
-    solver = build_training_solver(
-        instance,
-        n_ants=n_ants,
-        cand_list_size=cand_list_size,
-        backup_list_size=backup_list_size,
-        min_new_edges=min_new_edges,
-        device=str(device or 'cpu'),
-    )
+    if solver is None:
+        solver = build_training_solver(
+            instance,
+            n_ants=n_ants,
+            cand_list_size=cand_list_size,
+            backup_list_size=backup_list_size,
+            min_new_edges=min_new_edges,
+            device=str(device or 'cpu'),
+        )
     coords = torch.as_tensor(instance['coords'], dtype=torch.float32, device=device)
     demand = torch.as_tensor(instance['demand'], dtype=torch.float32, device=device)
     windows = torch.as_tensor(instance['windows'], dtype=torch.float32, device=device)
@@ -168,24 +171,43 @@ def gen_pyg_data(
     dst = nn_list.reshape(-1)
     edge_index = torch.stack([src, dst], dim=0)
 
-    edge_vec = coords[src] - coords[dst]
-    dist = torch.linalg.norm(edge_vec, dim=1)
-    dmax = torch.clamp(torch.cdist(coords, coords).max(), min=1e-8)
-    depot = torch.zeros((), dtype=torch.long, device=coords.device)
-    dist_i0 = torch.linalg.norm(coords[src] - coords[depot], dim=1)
-    dist_0j = torch.linalg.norm(coords[depot] - coords[dst], dim=1)
-    saving = dist_i0 + dist_0j - dist
-    earliest_arrival = windows[src, 0] + dist
-    tw_compat = (earliest_arrival <= windows[dst, 1]).float()
-    slack = (windows[dst, 1] - earliest_arrival) / time_scale
-    edge_attr = torch.stack([
-        dist,
-        dist / dmax,
-        saving,
-        tw_compat,
-        slack,
-        (dst == 0).float(),
-    ], dim=1)
+    dist = torch.linalg.norm(coords[src] - coords[dst], dim=1).view(n_nodes, k_sparse)
+    dist_mean = dist.mean(dim=1, keepdim=True).clamp_min(1e-8)
+    dist_norm = (dist / dist_mean).reshape(-1, 1)
+
+    tau = solver.pheromone_sparse.detach().to(device=device, dtype=torch.float32)
+    tau_mean = tau.mean(dim=1, keepdim=True).clamp_min(1e-8)
+    tau_rel = (tau / tau_mean).clamp_min(1e-8)
+    log_tau_rel = torch.log(tau_rel).clamp(-5.0, 5.0).reshape(-1, 1)
+    tau_cv = (tau.std(dim=1, keepdim=True) / tau_mean).clamp(0, 10).repeat_interleave(k_sparse, dim=0)
+
+    source_route = torch.as_tensor(np.asarray(solver.source_route, dtype=np.int64), device=device, dtype=torch.long)
+    is_source_succ = torch.zeros((src.numel(), 1), device=device, dtype=torch.float32)
+    is_source_pred = torch.zeros((src.numel(), 1), device=device, dtype=torch.float32)
+    if source_route.numel() > 1:
+        route_u = source_route[:-1]
+        route_v = source_route[1:]
+        succ = torch.full((n_nodes,), -1, device=device, dtype=torch.long)
+        pred = torch.full((n_nodes,), -1, device=device, dtype=torch.long)
+        customer_u = route_u != 0
+        customer_v = route_v != 0
+        succ[route_u[customer_u]] = route_v[customer_u]
+        pred[route_v[customer_v]] = route_u[customer_v]
+
+        src_is_customer = src != 0
+        is_source_succ[src_is_customer] = (dst[src_is_customer] == succ[src[src_is_customer]]).float().view(-1, 1)
+        is_source_pred[src_is_customer] = (dst[src_is_customer] == pred[src[src_is_customer]]).float().view(-1, 1)
+
+        src_is_depot = src == 0
+        if bool(src_is_depot.any().item()):
+            depot_succs = route_v[route_u == 0]
+            depot_preds = route_u[route_v == 0]
+            is_source_succ[src_is_depot] = torch.isin(dst[src_is_depot], depot_succs).float().view(-1, 1)
+            is_source_pred[src_is_depot] = torch.isin(dst[src_is_depot], depot_preds).float().view(-1, 1)
+
+    is_in_route = (is_source_succ > 0.5) | (is_source_pred > 0.5)
+    is_new_edge = (~is_in_route).float()
+    edge_attr = torch.cat([dist_norm, tau_cv, log_tau_rel, is_source_succ, is_source_pred, is_new_edge], dim=1)
 
     data = Data(x=node_features.float(), edge_index=edge_index.long(), edge_attr=edge_attr.float())
     data.n_nodes = int(n_nodes)

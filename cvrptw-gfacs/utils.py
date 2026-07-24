@@ -182,7 +182,8 @@ if __name__ == '__main__':
         torch.save(testDataset, f'../data/cvrptw/testDataset-{dataset_mode_prefix(tam=True, vrptw=args.vrptw)}{n}.pt')
 
     # main Dataset
-    for n in [100, 200, 500, 1000]:
+    # for n in [20, 100, 200, 500, 1000]:
+    for n in [50]:
         torch.manual_seed(123456)
         inst_list = []
         # for instance in dataset:
