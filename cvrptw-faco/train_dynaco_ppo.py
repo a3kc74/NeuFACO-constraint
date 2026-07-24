@@ -426,6 +426,16 @@ def selected_metric(metrics: dict[str, float], select_mode: str) -> float:
     return float(metrics[f'{select_mode}_best_T'])
 
 
+def resolve_run_name(args: argparse.Namespace) -> str:
+    if args.run_name:
+        return args.run_name
+    return (
+        f'dynaco_cvrptw{args.nodes}_sd{args.seed}'
+        f'_minnew{args.min_new_edges}_k{args.cand_list_size}'
+        f'_H{args.train_H}_miniH{args.train_mini_H}'
+    )
+
+
 def write_report(report_path: Path, args: argparse.Namespace, history: list[dict[str, Any]], best_epoch: int, best_value: float):
     report_path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -475,11 +485,12 @@ def train(args: argparse.Namespace):
     if args.cand_list_size is None:
         args.cand_list_size = args.k_sparse
     args.cand_list_size = int(args.cand_list_size)
+    args.run_name = resolve_run_name(args)
 
     print(f'DyNACO PPO training device: {DEVICE}')
     print(f'DyNACO PPO C++ backend threads: {configure_cpp_threads(args.threads)}')
     if USE_WANDB:
-        wandb.init(project='neufaco-cvrptw', name=args.run_name or f'dynaco_cvrptw{args.nodes}_sd{args.seed}')
+        wandb.init(project='neufaco-cvrptw', name=args.run_name)
         wandb.config.update(vars(args))
 
     model = Net(value_head=False).to(DEVICE)
@@ -487,7 +498,7 @@ def train(args: argparse.Namespace):
         model.load_state_dict(torch.load(args.pretrained, map_location=DEVICE))
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     val_list = load_val_dataset(args.nodes, args.cand_list_size, DEVICE, val_size=args.val_size)
-    save_dir = Path(args.output) / str(args.nodes) / (args.run_name or 'dynaco')
+    save_dir = Path(args.output) / str(args.nodes) / args.run_name
     save_dir.mkdir(parents=True, exist_ok=True)
 
     val_kwargs = vars(args).copy()
