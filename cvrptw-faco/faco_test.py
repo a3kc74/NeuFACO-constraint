@@ -59,9 +59,17 @@ def load_dataset(n_nodes: int, device: str, tam: bool = False, vrptw: bool = Fal
     return test_list
 
 
-def route_edges(route: Iterable[int]) -> set[frozenset[int]]:
+def _edge_key(u: int, v: int) -> int:
+    u = int(u)
+    v = int(v)
+    if u > v:
+        u, v = v, u
+    return (u << 32) | v
+
+
+def route_edges(route: Iterable[int]) -> set[int]:
     nodes = [int(node) for node in route]
-    return set(frozenset((u, v)) for u, v in zip(nodes[:-1], nodes[1:]))
+    return {_edge_key(u, v) for u, v in zip(nodes[:-1], nodes[1:])}
 
 
 def route_diversity(routes) -> float:
