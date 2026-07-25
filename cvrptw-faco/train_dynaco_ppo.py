@@ -157,7 +157,7 @@ def train_instance_dynaco(
         solver = build_solver(instance, **solver_kwargs(args, args.ants, args.cand_list_size))
         solver.seed_rng(args.seed + epoch * 100_000 + step_idx * args.batch_size + batch_offset)
 
-        rollout = []
+        rollout_groups = []
         best_seen = math.inf
         last_mean = math.inf
 
@@ -175,6 +175,10 @@ def train_instance_dynaco(
                 prior_old = model.reshape(pyg_data, model(pyg_data)).detach()
                 metrics['train_prior_std'] += float(prior_old.std(unbiased=False).item())
                 prior_updates += 1
+            rollout_group = {
+                'pyg_data': pyg_data.detach().clone(),
+                'items': [],
+            }
             for _mini in range(args.train_mini_H):
                 tau = solver.pheromone_sparse.detach().clone().to(DEVICE)
                 eta = solver.h_sparse_torch.detach().clone().to(DEVICE)
@@ -191,8 +195,7 @@ def train_instance_dynaco(
                     )
                     ndec_f = ndec.to(dtype=old_logp.dtype).clamp_min(1.0)
                     old_logp = old_logp / ndec_f
-                rollout.append({
-                    'pyg_data': pyg_data.detach().clone(),
+                rollout_group['items'].append({
                     'tau': tau,
                     'eta': eta,
                     'traces': traces,
@@ -206,6 +209,7 @@ def train_instance_dynaco(
                 best_seen = min(best_seen, best_cost)
                 last_mean = float(costs_t.mean().item())
                 solver.update_pheromone(routes[best_idx], best_cost)
+            rollout_groups.append(rollout_group)
 
         for _ in range(args.ppo_epochs):
             optimizer.zero_grad(set_to_none=True)
@@ -213,38 +217,39 @@ def train_instance_dynaco(
             entropies = []
             approx_kls = []
             clip_fracs = []
-            for item in rollout:
-                item_pyg_data = item['pyg_data']
-                prior_new = model.reshape(item_pyg_data, model(item_pyg_data))
-                new_logp, entropy, ndec = replay_logp_from_trace(
-                    item['traces'], item['tau'], item['eta'], prior_new,
-                    alpha=args.alpha, disable_heuristic=args.disable_heuristic,
-                )
-                ndec_f = ndec.to(dtype=new_logp.dtype).clamp_min(1.0)
-                new_logp = new_logp / ndec_f
-                entropy = entropy / ndec_f
-                stochastic_mask = ndec > 0
-                if not bool(stochastic_mask.any().item()):
-                    continue
-                new_logp = new_logp[stochastic_mask]
-                old_logp = item['old_logp'][stochastic_mask]
-                entropy = entropy[stochastic_mask]
-                if args.nls:
-                    combined_costs = args.nls_beta * item['costs'] + (1.0 - args.nls_beta) * item['costs_raw']
-                else:
-                    combined_costs = item['costs']
-                combined_costs = combined_costs[stochastic_mask]
-                advantage = (combined_costs.mean() - combined_costs).detach()
-                if not args.no_adv_norm:
-                    advantage = (advantage - advantage.mean()) / (advantage.std(unbiased=False) + 1e-8)
-                ratio = torch.exp(new_logp - old_logp)
-                log_ratio = new_logp - old_logp
-                approx_kls.append((0.5 * log_ratio.pow(2)).mean())
-                clip_fracs.append(((ratio > 1.0 + args.ppo_clip) | (ratio < 1.0 - args.ppo_clip)).float().mean())
-                surr1 = ratio * advantage
-                surr2 = torch.clamp(ratio, 1.0 - args.ppo_clip, 1.0 + args.ppo_clip) * advantage
-                losses.append(-torch.min(surr1, surr2).mean())
-                entropies.append(entropy.mean())
+            for group in rollout_groups:
+                group_pyg_data = group['pyg_data']
+                prior_new = model.reshape(group_pyg_data, model(group_pyg_data))
+                for item in group['items']:
+                    new_logp, entropy, ndec = replay_logp_from_trace(
+                        item['traces'], item['tau'], item['eta'], prior_new,
+                        alpha=args.alpha, disable_heuristic=args.disable_heuristic,
+                    )
+                    ndec_f = ndec.to(dtype=new_logp.dtype).clamp_min(1.0)
+                    new_logp = new_logp / ndec_f
+                    entropy = entropy / ndec_f
+                    stochastic_mask = ndec > 0
+                    if not bool(stochastic_mask.any().item()):
+                        continue
+                    new_logp = new_logp[stochastic_mask]
+                    old_logp = item['old_logp'][stochastic_mask]
+                    entropy = entropy[stochastic_mask]
+                    if args.nls:
+                        combined_costs = args.nls_beta * item['costs'] + (1.0 - args.nls_beta) * item['costs_raw']
+                    else:
+                        combined_costs = item['costs']
+                    combined_costs = combined_costs[stochastic_mask]
+                    advantage = (combined_costs.mean() - combined_costs).detach()
+                    if not args.no_adv_norm:
+                        advantage = (advantage - advantage.mean()) / (advantage.std(unbiased=False) + 1e-8)
+                    ratio = torch.exp(new_logp - old_logp)
+                    log_ratio = new_logp - old_logp
+                    approx_kls.append((0.5 * log_ratio.pow(2)).mean())
+                    clip_fracs.append(((ratio > 1.0 + args.ppo_clip) | (ratio < 1.0 - args.ppo_clip)).float().mean())
+                    surr1 = ratio * advantage
+                    surr2 = torch.clamp(ratio, 1.0 - args.ppo_clip, 1.0 + args.ppo_clip) * advantage
+                    losses.append(-torch.min(surr1, surr2).mean())
+                    entropies.append(entropy.mean())
             if not losses:
                 continue
             loss = torch.stack(losses).mean() - args.entropy_coeff * torch.stack(entropies).mean()
