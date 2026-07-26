@@ -552,6 +552,7 @@ def write_report(
     history: list[dict[str, Any]],
     best_epoch: int,
     best_value: float,
+    best_step: int = 0,
     stopped_reason: str = '',
 ):
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -568,20 +569,22 @@ def write_report(
         f.write(f'- Branch: `{branch}`\n')
         f.write(f'- Commit: `{commit}`\n')
         f.write(f'- Best epoch: `{best_epoch}`\n')
+        f.write(f'- Best step: `{best_step}`\n')
         f.write(f'- Best selected metric: `{best_value:.6f}`\n')
-        f.write(f'- Validation mode: `{args.val_infer_mode}`; selection mode: `{args.select_metric_mode}`\n\n')
+        f.write(f'- Validation mode: `{args.val_infer_mode}`; selection mode: `{args.select_metric_mode}`\n')
+        f.write(f'- Validation frequency: every `{args.val_every_epochs}` epoch(s), plus final epoch\n\n')
         if stopped_reason:
             f.write(f'- Stopped early: `{stopped_reason}`\n\n')
         f.write('## Command\n\n')
         f.write('```powershell\nuv run .\\train_dynaco_ppo.py ' + ' '.join(os.sys.argv[1:]) + '\n```\n\n')
-        f.write('## Per-Epoch Metrics\n\n')
+        f.write('## Per-Step Metrics\n\n')
         diag_keys = [
             'train_loss', 'train_entropy', 'train_approx_kl', 'train_clip_frac',
             'train_prior_mean', 'train_prior_std', 'train_prior_max', 'train_grad_norm',
             'train_raw_adv_std', 'train_stochastic_decisions', 'train_no_stochastic_frac',
             'train_tau_cv', 'train_ppo_epochs_used', 'lr',
         ]
-        headers = ['epoch', 'train_best_cost', 'train_mean_cost'] + diag_keys + val_keys
+        headers = ['step', 'epoch', 'train_best_cost', 'train_mean_cost'] + diag_keys + val_keys
         f.write('| ' + ' | '.join(headers) + ' |\n')
         f.write('| ' + ' | '.join(['---'] * len(headers)) + ' |\n')
         for row in history:
@@ -609,6 +612,7 @@ def train(args: argparse.Namespace):
     if args.cand_list_size is None:
         args.cand_list_size = args.k_sparse
     args.cand_list_size = int(args.cand_list_size)
+    args.val_every_epochs = max(1, int(args.val_every_epochs))
     args.run_name = resolve_run_name(args)
 
     print(f'DyNACO PPO training device: {DEVICE}')
@@ -633,19 +637,21 @@ def train(args: argparse.Namespace):
     history = []
     best_value = math.inf
     best_epoch = -1
+    best_step = 0
     best_for_patience = math.inf
-    epochs_without_improvement = 0
+    validation_checks_without_improvement = 0
     stopped_reason = ''
     baseline_metrics = validate_model(None, val_list, args.val_ants, args.val_infer_mode, -1, **val_kwargs)
-    history.append({'epoch': -1, 'train_best_cost': math.nan, 'train_mean_cost': math.nan, **baseline_metrics})
+    history.append({'step': 0, 'epoch': -1, 'train_best_cost': math.nan, 'train_mean_cost': math.nan, **baseline_metrics})
     initial_metrics = evaluate_with_optional_ema(
         model,
         ema_state,
         lambda eval_model: validate_model(eval_model, val_list, args.val_ants, args.val_infer_mode, 0, **val_kwargs),
     )
-    history.append({'epoch': 0, 'train_best_cost': math.nan, 'train_mean_cost': math.nan, **initial_metrics})
+    history.append({'step': 0, 'epoch': 0, 'train_best_cost': math.nan, 'train_mean_cost': math.nan, **initial_metrics})
     best_value = selected_metric(initial_metrics, args.select_metric_mode)
     best_epoch = 0
+    best_step = 0
     best_for_patience = best_value
     torch.save(ema_state if ema_state is not None else model.state_dict(), save_dir / 'best.pt')
 
@@ -663,35 +669,41 @@ def train(args: argparse.Namespace):
         if scheduler is not None:
             scheduler.step()
         train_summary['lr'] = float(optimizer.param_groups[0]['lr'])
-        val_metrics = evaluate_with_optional_ema(
-            model,
-            ema_state,
-            lambda eval_model: validate_model(eval_model, val_list, args.val_ants, args.val_infer_mode, epoch, **val_kwargs),
-        )
-        row = {'epoch': epoch, **train_summary, **val_metrics}
+        global_step = epoch * args.steps
+        should_validate = (epoch % args.val_every_epochs == 0) or (epoch == args.epochs)
+        val_metrics = {}
+        if should_validate:
+            val_metrics = evaluate_with_optional_ema(
+                model,
+                ema_state,
+                lambda eval_model: validate_model(eval_model, val_list, args.val_ants, args.val_infer_mode, epoch, **val_kwargs),
+            )
+        row = {'step': global_step, 'epoch': epoch, **train_summary, **val_metrics}
         history.append(row)
-        current_value = selected_metric(val_metrics, args.select_metric_mode)
-        if current_value < best_value:
-            best_value = current_value
-            best_epoch = epoch
-            torch.save(ema_state if ema_state is not None else model.state_dict(), save_dir / 'best.pt')
-        if current_value < best_for_patience - args.early_stop_min_delta:
-            best_for_patience = current_value
-            epochs_without_improvement = 0
-        else:
-            epochs_without_improvement += 1
+        if should_validate:
+            current_value = selected_metric(val_metrics, args.select_metric_mode)
+            if current_value < best_value:
+                best_value = current_value
+                best_epoch = epoch
+                best_step = global_step
+                torch.save(ema_state if ema_state is not None else model.state_dict(), save_dir / 'best.pt')
+            if current_value < best_for_patience - args.early_stop_min_delta:
+                best_for_patience = current_value
+                validation_checks_without_improvement = 0
+            else:
+                validation_checks_without_improvement += 1
         torch.save(ema_state if ema_state is not None else model.state_dict(), save_dir / f'epoch-{epoch}.pt')
         if USE_WANDB:
-            wandb.log(row, step=epoch)
-        if args.early_stop_patience > 0 and epochs_without_improvement >= args.early_stop_patience:
+            wandb.log(row, step=global_step)
+        if should_validate and args.early_stop_patience > 0 and validation_checks_without_improvement >= args.early_stop_patience:
             stopped_reason = (
                 f'no selected-metric improvement > {args.early_stop_min_delta:g} '
-                f'for {args.early_stop_patience} epochs'
+                f'for {args.early_stop_patience} validation checks'
             )
-            write_report(Path(args.report_path), args, history, best_epoch, best_value, stopped_reason)
+            write_report(Path(args.report_path), args, history, best_epoch, best_value, best_step, stopped_reason)
             break
-        write_report(Path(args.report_path), args, history, best_epoch, best_value, stopped_reason)
-    write_report(Path(args.report_path), args, history, best_epoch, best_value, stopped_reason)
+        write_report(Path(args.report_path), args, history, best_epoch, best_value, best_step, stopped_reason)
+    write_report(Path(args.report_path), args, history, best_epoch, best_value, best_step, stopped_reason)
     return history
 
 
@@ -723,6 +735,7 @@ def parse_args():
     parser.add_argument('--train_H', type=int, default=1)
     parser.add_argument('--train_mini_H', type=int, default=4)
     parser.add_argument('--val_size', type=int, default=20)
+    parser.add_argument('--val_every_epochs', type=int, default=1)
     parser.add_argument('--val_n_iter', type=int, default=10)
     parser.add_argument('--val_mini_H', type=int, default=10)
     parser.add_argument('--val_infer_mode', choices=['faco_test', 'faco_test_ib', 'both'], default='faco_test_ib')

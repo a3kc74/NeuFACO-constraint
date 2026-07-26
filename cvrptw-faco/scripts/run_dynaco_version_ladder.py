@@ -112,7 +112,7 @@ def parse_report(path: Path, expected_epochs: int = 40) -> dict[str, str | float
     lines = text.splitlines()
     header = None
     for idx, line in enumerate(lines):
-        if line.startswith("| epoch |"):
+        if line.startswith("| epoch |") or line.startswith("| step |"):
             header = [cell.strip() for cell in line.strip("|").split("|")]
             for row_line in lines[idx + 2:]:
                 if not row_line.startswith("|"):

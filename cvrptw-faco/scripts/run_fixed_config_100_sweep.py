@@ -182,7 +182,7 @@ def report_status(path: Path, expected_epochs: int) -> dict[str, object]:
     header = None
     lines = text.splitlines()
     for idx, line in enumerate(lines):
-        if line.startswith("| epoch |"):
+        if line.startswith("| epoch |") or line.startswith("| step |"):
             header = [cell.strip() for cell in line.strip("|").split("|")]
             for row_line in lines[idx + 2:]:
                 if not row_line.startswith("|"):
