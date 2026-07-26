@@ -5,12 +5,13 @@ import torch_geometric.nn as gnn
 
 
 class EmbNet(nn.Module):
-    def __init__(self, depth=12, node_feats=7, edge_feats=6, units=32, act_fn='silu', agg_fn='mean'):
+    def __init__(self, depth=12, node_feats=7, edge_feats=6, units=32, act_fn='silu', agg_fn='mean', norm_type='batch'):
         super().__init__()
         self.depth = depth
         self.node_feats = node_feats
         self.edge_feats = edge_feats
         self.units = units
+        self.norm_type = norm_type
         self.act_fn = getattr(F, act_fn)
         self.agg_fn = getattr(gnn, f'global_{agg_fn}_pool')
         self.v_lin0 = nn.Linear(self.node_feats, self.units)
@@ -18,10 +19,11 @@ class EmbNet(nn.Module):
         self.v_lins2 = nn.ModuleList([nn.Linear(self.units, self.units) for _ in range(self.depth)])
         self.v_lins3 = nn.ModuleList([nn.Linear(self.units, self.units) for _ in range(self.depth)])
         self.v_lins4 = nn.ModuleList([nn.Linear(self.units, self.units) for _ in range(self.depth)])
-        self.v_bns = nn.ModuleList([gnn.BatchNorm(self.units) for _ in range(self.depth)])
+        norm_cls = nn.LayerNorm if norm_type == 'layer' else gnn.BatchNorm
+        self.v_bns = nn.ModuleList([norm_cls(self.units) for _ in range(self.depth)])
         self.e_lin0 = nn.Linear(self.edge_feats, self.units)
         self.e_lins0 = nn.ModuleList([nn.Linear(self.units, self.units) for _ in range(self.depth)])
-        self.e_bns = nn.ModuleList([gnn.BatchNorm(self.units) for _ in range(self.depth)])
+        self.e_bns = nn.ModuleList([norm_cls(self.units) for _ in range(self.depth)])
 
     def reset_parameters(self):
         raise NotImplementedError
@@ -78,9 +80,9 @@ class ParNet(MLP):
 
 
 class Net(nn.Module):
-    def __init__(self, value_head=False, node_feats=7, edge_feats=6, units=32):
+    def __init__(self, value_head=False, node_feats=7, edge_feats=6, units=32, norm_type='batch'):
         super().__init__()
-        self.emb_net = EmbNet(node_feats=node_feats, edge_feats=edge_feats, units=units)
+        self.emb_net = EmbNet(node_feats=node_feats, edge_feats=edge_feats, units=units, norm_type=norm_type)
         self.par_net_heu = ParNet(units=units)
         self.value_head = value_head
         self.value_net = nn.Sequential(

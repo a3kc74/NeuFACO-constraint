@@ -137,6 +137,7 @@ def gen_pyg_data(
     device: str | torch.device | None = None,
     return_solver: bool = False,
     solver: MFACO_CVRPTW | None = None,
+    edge_feature_mode: str = 'full',
 ):
     instance = normalize_instance(instance, device=device)
     if solver is None:
@@ -175,38 +176,48 @@ def gen_pyg_data(
     dist_mean = dist.mean(dim=1, keepdim=True).clamp_min(1e-8)
     dist_norm = (dist / dist_mean).reshape(-1, 1)
 
-    tau = solver.pheromone_sparse.detach().to(device=device, dtype=torch.float32)
-    tau_mean = tau.mean(dim=1, keepdim=True).clamp_min(1e-8)
-    tau_rel = (tau / tau_mean).clamp_min(1e-8)
-    log_tau_rel = torch.log(tau_rel).clamp(-5.0, 5.0).reshape(-1, 1)
-    tau_cv = (tau.std(dim=1, keepdim=True) / tau_mean).clamp(0, 10).repeat_interleave(k_sparse, dim=0)
+    dynamic_shape = (src.numel(), 1)
+    if edge_feature_mode == 'static':
+        tau_cv = torch.zeros(dynamic_shape, device=device, dtype=torch.float32)
+        log_tau_rel = torch.zeros(dynamic_shape, device=device, dtype=torch.float32)
+        is_source_succ = torch.zeros(dynamic_shape, device=device, dtype=torch.float32)
+        is_source_pred = torch.zeros(dynamic_shape, device=device, dtype=torch.float32)
+        is_new_edge = torch.zeros(dynamic_shape, device=device, dtype=torch.float32)
+    elif edge_feature_mode == 'full':
+        tau = solver.pheromone_sparse.detach().to(device=device, dtype=torch.float32)
+        tau_mean = tau.mean(dim=1, keepdim=True).clamp_min(1e-8)
+        tau_rel = (tau / tau_mean).clamp_min(1e-8)
+        log_tau_rel = torch.log(tau_rel).clamp(-5.0, 5.0).reshape(-1, 1)
+        tau_cv = (tau.std(dim=1, keepdim=True) / tau_mean).clamp(0, 10).repeat_interleave(k_sparse, dim=0)
 
-    source_route = torch.as_tensor(np.asarray(solver.source_route, dtype=np.int64), device=device, dtype=torch.long)
-    is_source_succ = torch.zeros((src.numel(), 1), device=device, dtype=torch.float32)
-    is_source_pred = torch.zeros((src.numel(), 1), device=device, dtype=torch.float32)
-    if source_route.numel() > 1:
-        route_u = source_route[:-1]
-        route_v = source_route[1:]
-        succ = torch.full((n_nodes,), -1, device=device, dtype=torch.long)
-        pred = torch.full((n_nodes,), -1, device=device, dtype=torch.long)
-        customer_u = route_u != 0
-        customer_v = route_v != 0
-        succ[route_u[customer_u]] = route_v[customer_u]
-        pred[route_v[customer_v]] = route_u[customer_v]
+        source_route = torch.as_tensor(np.asarray(solver.source_route, dtype=np.int64), device=device, dtype=torch.long)
+        is_source_succ = torch.zeros(dynamic_shape, device=device, dtype=torch.float32)
+        is_source_pred = torch.zeros(dynamic_shape, device=device, dtype=torch.float32)
+        if source_route.numel() > 1:
+            route_u = source_route[:-1]
+            route_v = source_route[1:]
+            succ = torch.full((n_nodes,), -1, device=device, dtype=torch.long)
+            pred = torch.full((n_nodes,), -1, device=device, dtype=torch.long)
+            customer_u = route_u != 0
+            customer_v = route_v != 0
+            succ[route_u[customer_u]] = route_v[customer_u]
+            pred[route_v[customer_v]] = route_u[customer_v]
 
-        src_is_customer = src != 0
-        is_source_succ[src_is_customer] = (dst[src_is_customer] == succ[src[src_is_customer]]).float().view(-1, 1)
-        is_source_pred[src_is_customer] = (dst[src_is_customer] == pred[src[src_is_customer]]).float().view(-1, 1)
+            src_is_customer = src != 0
+            is_source_succ[src_is_customer] = (dst[src_is_customer] == succ[src[src_is_customer]]).float().view(-1, 1)
+            is_source_pred[src_is_customer] = (dst[src_is_customer] == pred[src[src_is_customer]]).float().view(-1, 1)
 
-        src_is_depot = src == 0
-        if bool(src_is_depot.any().item()):
-            depot_succs = route_v[route_u == 0]
-            depot_preds = route_u[route_v == 0]
-            is_source_succ[src_is_depot] = torch.isin(dst[src_is_depot], depot_succs).float().view(-1, 1)
-            is_source_pred[src_is_depot] = torch.isin(dst[src_is_depot], depot_preds).float().view(-1, 1)
+            src_is_depot = src == 0
+            if bool(src_is_depot.any().item()):
+                depot_succs = route_v[route_u == 0]
+                depot_preds = route_u[route_v == 0]
+                is_source_succ[src_is_depot] = torch.isin(dst[src_is_depot], depot_succs).float().view(-1, 1)
+                is_source_pred[src_is_depot] = torch.isin(dst[src_is_depot], depot_preds).float().view(-1, 1)
 
-    is_in_route = (is_source_succ > 0.5) | (is_source_pred > 0.5)
-    is_new_edge = (~is_in_route).float()
+        is_in_route = (is_source_succ > 0.5) | (is_source_pred > 0.5)
+        is_new_edge = (~is_in_route).float()
+    else:
+        raise ValueError(f'unknown edge_feature_mode: {edge_feature_mode}')
     edge_attr = torch.cat([dist_norm, tau_cv, log_tau_rel, is_source_succ, is_source_pred, is_new_edge], dim=1)
 
     data = Data(x=node_features.float(), edge_index=edge_index.long(), edge_attr=edge_attr.float())

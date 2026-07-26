@@ -78,7 +78,33 @@ def test_gen_pyg_data_reflects_solver_dynamic_state():
     assert not before.equal(after)
 
 
+def test_gen_pyg_data_static_edge_feature_mode_zeros_dynamic_columns():
+    instance = generate_cvrptw_instance(5, seed=321)
+    solver = build_solver(instance, n_ants=4, cand_list_size=3, backup_list_size=4, min_new_edges=1)
+
+    before = gen_pyg_data(instance, cand_list_size=3, solver=solver, edge_feature_mode='static').edge_attr.clone()
+    costs, routes, *_ = solver.sample()
+    best_idx = int(costs.argmin() if hasattr(costs, "argmin") else min(range(len(costs)), key=lambda i: costs[i]))
+    solver.update_pheromone(routes[best_idx], float(costs[best_idx]))
+    after = gen_pyg_data(instance, cand_list_size=3, solver=solver, edge_feature_mode='static').edge_attr
+
+    assert before.shape[1] == 6
+    assert torch.all(before[:, 1:] == 0)
+    assert torch.all(after[:, 1:] == 0)
+    assert torch.equal(before, after)
+
+
 def test_train_instance_replays_each_rollout_with_its_own_dynamic_state(monkeypatch):
+    run_train_instance_with_fake_dynamic_states(monkeypatch, train_h=2, train_mini_h=1)
+
+
+def test_train_instance_reuses_policy_forward_for_rollouts_from_same_dynamic_state(monkeypatch):
+    model = run_train_instance_with_fake_dynamic_states(monkeypatch, train_h=2, train_mini_h=3)
+
+    assert model.grad_enabled_markers == [1.0, 4.0]
+
+
+def run_train_instance_with_fake_dynamic_states(monkeypatch, train_h, train_mini_h):
     class FakePygData:
         def __init__(self, state_marker):
             self.state_marker = float(state_marker)
@@ -116,8 +142,11 @@ def test_train_instance_replays_each_rollout_with_its_own_dynamic_state(monkeypa
         def __init__(self):
             super().__init__()
             self.scale = torch.nn.Parameter(torch.tensor(1.0))
+            self.grad_enabled_markers = []
 
         def forward(self, pyg_data):
+            if torch.is_grad_enabled():
+                self.grad_enabled_markers.append(pyg_data.state_marker)
             return self.scale * torch.full((4,), pyg_data.state_marker, dtype=torch.float32)
 
         @staticmethod
@@ -163,12 +192,16 @@ def test_train_instance_replays_each_rollout_with_its_own_dynamic_state(monkeypa
         parallel_traced=False,
         seed=0,
         batch_size=1,
-        train_H=2,
-        train_mini_H=1,
+        train_H=train_h,
+        train_mini_H=train_mini_h,
         ppo_epochs=1,
         ppo_clip=0.1,
         entropy_coeff=0.0,
         no_adv_norm=True,
+        advantage_mode='per_step',
+        adv_clip=0.0,
+        target_kl=0.0,
+        edge_feature_mode='full',
         max_grad_norm=1.0,
     )
 
@@ -177,4 +210,12 @@ def test_train_instance_replays_each_rollout_with_its_own_dynamic_state(monkeypa
 
     dynaco_ppo.train_instance_dynaco(model, optimizer, [(None, {})], args, epoch=1, step_idx=0)
 
-    assert replayed_pairs == [(1.0, 1.0), (2.0, 2.0)]
+    expected_pairs = []
+    tau_marker = 1
+    for outer_idx in range(train_h):
+        prior_marker = float(1 + outer_idx * train_mini_h)
+        for _mini in range(train_mini_h):
+            expected_pairs.append((float(tau_marker), prior_marker))
+            tau_marker += 1
+    assert replayed_pairs == expected_pairs
+    return model

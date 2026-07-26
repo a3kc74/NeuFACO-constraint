@@ -130,6 +130,82 @@ def solver_kwargs(args: argparse.Namespace, n_ants: int, cand_list_size: int) ->
     }
 
 
+def _combined_costs(item: dict[str, Any], args: argparse.Namespace) -> torch.Tensor:
+    if args.nls:
+        return args.nls_beta * item['costs'] + (1.0 - args.nls_beta) * item['costs_raw']
+    return item['costs']
+
+
+def _annotate_advantages(rollout_groups: list[dict[str, Any]], args: argparse.Namespace) -> float:
+    raw_advantages = []
+    for group in rollout_groups:
+        if args.advantage_mode == 'macro_relative':
+            relative_advantages = []
+            for item in group['items']:
+                costs = _combined_costs(item, args)
+                mean_cost = costs.mean()
+                relative_advantages.append(((mean_cost - costs) / (mean_cost.abs() + 1e-6)).detach())
+            if relative_advantages:
+                outer_advantage = torch.cat(relative_advantages)
+                raw_advantages.append(outer_advantage)
+                if not args.no_adv_norm:
+                    std = outer_advantage.std(unbiased=False)
+                    if float(std.item()) > 1e-4:
+                        outer_advantage = (outer_advantage - outer_advantage.mean()) / (std + 1e-6)
+                    else:
+                        outer_advantage = torch.zeros_like(outer_advantage)
+                if args.adv_clip > 0:
+                    outer_advantage = outer_advantage.clamp(-args.adv_clip, args.adv_clip)
+                offset = 0
+                for item in group['items']:
+                    width = int(item['costs'].numel())
+                    item['advantage'] = outer_advantage[offset:offset + width]
+                    offset += width
+        else:
+            for item in group['items']:
+                costs = _combined_costs(item, args)
+                advantage = (costs.mean() - costs).detach()
+                raw_advantages.append(advantage)
+                if not args.no_adv_norm:
+                    advantage = (advantage - advantage.mean()) / (advantage.std(unbiased=False) + 1e-8)
+                if args.adv_clip > 0:
+                    advantage = advantage.clamp(-args.adv_clip, args.adv_clip)
+                item['advantage'] = advantage
+    if not raw_advantages:
+        return 0.0
+    return float(torch.cat(raw_advantages).std(unbiased=False).item())
+
+
+def _mean_or_zero(values: list[torch.Tensor]) -> torch.Tensor:
+    if not values:
+        return torch.tensor(0.0, device=DEVICE)
+    return torch.stack(values).mean()
+
+
+def update_ema_state(ema_state: dict[str, torch.Tensor] | None, model, decay: float):
+    if ema_state is None or decay <= 0:
+        return None
+    with torch.no_grad():
+        model_state = model.state_dict()
+        for key, value in model_state.items():
+            if torch.is_floating_point(value):
+                ema_state[key].mul_(decay).add_(value.detach(), alpha=1.0 - decay)
+            else:
+                ema_state[key].copy_(value)
+    return ema_state
+
+
+def evaluate_with_optional_ema(model, ema_state: dict[str, torch.Tensor] | None, fn):
+    if ema_state is None:
+        return fn(model)
+    live_state = {key: value.detach().clone() for key, value in model.state_dict().items()}
+    model.load_state_dict(ema_state, strict=True)
+    try:
+        return fn(model)
+    finally:
+        model.load_state_dict(live_state, strict=True)
+
+
 def train_instance_dynaco(
     model,
     optimizer: torch.optim.Optimizer,
@@ -149,15 +225,25 @@ def train_instance_dynaco(
         'train_approx_kl': 0.0,
         'train_clip_frac': 0.0,
         'train_prior_std': 0.0,
+        'train_prior_mean': 0.0,
+        'train_prior_max': 0.0,
+        'train_grad_norm': 0.0,
+        'train_raw_adv_std': 0.0,
+        'train_stochastic_decisions': 0.0,
+        'train_no_stochastic_frac': 0.0,
+        'train_tau_cv': 0.0,
+        'train_ppo_epochs_used': 0.0,
     }
     instances_seen = 0
     prior_updates = 0
+    replay_items = 0
+    ppo_updates = 0
+    rollout_groups = []
 
     for batch_offset, (_pyg_data, instance) in enumerate(data):
         solver = build_solver(instance, **solver_kwargs(args, args.ants, args.cand_list_size))
         solver.seed_rng(args.seed + epoch * 100_000 + step_idx * args.batch_size + batch_offset)
 
-        rollout_groups = []
         best_seen = math.inf
         last_mean = math.inf
 
@@ -170,10 +256,13 @@ def train_instance_dynaco(
                 min_new_edges=args.min_new_edges,
                 device=DEVICE,
                 solver=solver,
+                edge_feature_mode=args.edge_feature_mode,
             ).to(DEVICE)
             with torch.no_grad():
                 prior_old = model.reshape(pyg_data, model(pyg_data)).detach()
                 metrics['train_prior_std'] += float(prior_old.std(unbiased=False).item())
+                metrics['train_prior_mean'] += float(prior_old.mean().item())
+                metrics['train_prior_max'] += float(prior_old.max().item())
                 prior_updates += 1
             rollout_group = {
                 'pyg_data': pyg_data.detach().clone(),
@@ -182,6 +271,8 @@ def train_instance_dynaco(
             for _mini in range(args.train_mini_H):
                 tau = solver.pheromone_sparse.detach().clone().to(DEVICE)
                 eta = solver.h_sparse_torch.detach().clone().to(DEVICE)
+                tau_mean = tau.mean().clamp_min(EPS)
+                metrics['train_tau_cv'] += float((tau.std(unbiased=False) / tau_mean).item())
                 costs, routes, _, _, traces, costs_raw, _, _, _ = solver.sample(
                     require_prob=True,
                     prior=prior_old.cpu().numpy(),
@@ -195,6 +286,9 @@ def train_instance_dynaco(
                     )
                     ndec_f = ndec.to(dtype=old_logp.dtype).clamp_min(1.0)
                     old_logp = old_logp / ndec_f
+                metrics['train_stochastic_decisions'] += float(ndec.float().mean().item())
+                metrics['train_no_stochastic_frac'] += float((ndec == 0).float().mean().item())
+                replay_items += 1
                 rollout_group['items'].append({
                     'tau': tau,
                     'eta': eta,
@@ -211,68 +305,76 @@ def train_instance_dynaco(
                 solver.update_pheromone(routes[best_idx], best_cost)
             rollout_groups.append(rollout_group)
 
-        for _ in range(args.ppo_epochs):
-            optimizer.zero_grad(set_to_none=True)
-            losses = []
-            entropies = []
-            approx_kls = []
-            clip_fracs = []
-            for group in rollout_groups:
-                group_pyg_data = group['pyg_data']
-                prior_new = model.reshape(group_pyg_data, model(group_pyg_data))
-                for item in group['items']:
-                    new_logp, entropy, ndec = replay_logp_from_trace(
-                        item['traces'], item['tau'], item['eta'], prior_new,
-                        alpha=args.alpha, disable_heuristic=args.disable_heuristic,
-                    )
-                    ndec_f = ndec.to(dtype=new_logp.dtype).clamp_min(1.0)
-                    new_logp = new_logp / ndec_f
-                    entropy = entropy / ndec_f
-                    stochastic_mask = ndec > 0
-                    if not bool(stochastic_mask.any().item()):
-                        continue
-                    new_logp = new_logp[stochastic_mask]
-                    old_logp = item['old_logp'][stochastic_mask]
-                    entropy = entropy[stochastic_mask]
-                    if args.nls:
-                        combined_costs = args.nls_beta * item['costs'] + (1.0 - args.nls_beta) * item['costs_raw']
-                    else:
-                        combined_costs = item['costs']
-                    combined_costs = combined_costs[stochastic_mask]
-                    advantage = (combined_costs.mean() - combined_costs).detach()
-                    if not args.no_adv_norm:
-                        advantage = (advantage - advantage.mean()) / (advantage.std(unbiased=False) + 1e-8)
-                    ratio = torch.exp(new_logp - old_logp)
-                    log_ratio = new_logp - old_logp
-                    approx_kls.append((0.5 * log_ratio.pow(2)).mean())
-                    clip_fracs.append(((ratio > 1.0 + args.ppo_clip) | (ratio < 1.0 - args.ppo_clip)).float().mean())
-                    surr1 = ratio * advantage
-                    surr2 = torch.clamp(ratio, 1.0 - args.ppo_clip, 1.0 + args.ppo_clip) * advantage
-                    losses.append(-torch.min(surr1, surr2).mean())
-                    entropies.append(entropy.mean())
-            if not losses:
-                continue
-            loss = torch.stack(losses).mean() - args.entropy_coeff * torch.stack(entropies).mean()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-            optimizer.step()
-            metrics['train_loss'] += float(loss.detach().item())
-            metrics['train_entropy'] += float(torch.stack(entropies).mean().detach().item())
-            metrics['train_approx_kl'] += float(torch.stack(approx_kls).mean().detach().item())
-            metrics['train_clip_frac'] += float(torch.stack(clip_fracs).mean().detach().item())
-
         metrics['train_mean_cost'] += last_mean
         metrics['train_best_cost'] += best_seen
         instances_seen += 1
 
+    metrics['train_raw_adv_std'] = _annotate_advantages(rollout_groups, args)
+    for _ in range(args.ppo_epochs):
+        optimizer.zero_grad(set_to_none=True)
+        losses = []
+        entropies = []
+        approx_kls = []
+        clip_fracs = []
+        for group in rollout_groups:
+            group_pyg_data = group['pyg_data']
+            prior_new = model.reshape(group_pyg_data, model(group_pyg_data))
+            for item in group['items']:
+                new_logp, entropy, ndec = replay_logp_from_trace(
+                    item['traces'], item['tau'], item['eta'], prior_new,
+                    alpha=args.alpha, disable_heuristic=args.disable_heuristic,
+                )
+                ndec_f = ndec.to(dtype=new_logp.dtype).clamp_min(1.0)
+                new_logp = new_logp / ndec_f
+                entropy = entropy / ndec_f
+                stochastic_mask = ndec > 0
+                if not bool(stochastic_mask.any().item()):
+                    continue
+                new_logp = new_logp[stochastic_mask]
+                old_logp = item['old_logp'][stochastic_mask]
+                entropy = entropy[stochastic_mask]
+                advantage = item['advantage'][stochastic_mask]
+                ratio = torch.exp(new_logp - old_logp)
+                log_ratio = new_logp - old_logp
+                approx_kls.append((0.5 * log_ratio.pow(2)).mean())
+                clip_fracs.append(((ratio > 1.0 + args.ppo_clip) | (ratio < 1.0 - args.ppo_clip)).float().mean())
+                surr1 = ratio * advantage
+                surr2 = torch.clamp(ratio, 1.0 - args.ppo_clip, 1.0 + args.ppo_clip) * advantage
+                losses.append(-torch.min(surr1, surr2).mean())
+                entropies.append(entropy.mean())
+        if not losses:
+            continue
+        loss = torch.stack(losses).mean() - args.entropy_coeff * torch.stack(entropies).mean()
+        loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+        optimizer.step()
+        ppo_updates += 1
+        mean_entropy = _mean_or_zero(entropies)
+        mean_kl = _mean_or_zero(approx_kls)
+        mean_clip_frac = _mean_or_zero(clip_fracs)
+        metrics['train_loss'] += float(loss.detach().item())
+        metrics['train_entropy'] += float(mean_entropy.detach().item())
+        metrics['train_approx_kl'] += float(mean_kl.detach().item())
+        metrics['train_clip_frac'] += float(mean_clip_frac.detach().item())
+        metrics['train_grad_norm'] += float(torch.as_tensor(grad_norm).detach().item())
+        if args.target_kl > 0 and float(mean_kl.detach().item()) > 1.5 * args.target_kl:
+            break
+
     denom = max(instances_seen, 1)
     metrics['train_mean_cost'] /= denom
     metrics['train_best_cost'] /= denom
-    metrics['train_loss'] /= max(denom * args.ppo_epochs, 1)
-    metrics['train_entropy'] /= max(denom * args.ppo_epochs, 1)
-    metrics['train_approx_kl'] /= max(denom * args.ppo_epochs, 1)
-    metrics['train_clip_frac'] /= max(denom * args.ppo_epochs, 1)
+    metrics['train_loss'] /= max(ppo_updates, 1)
+    metrics['train_entropy'] /= max(ppo_updates, 1)
+    metrics['train_approx_kl'] /= max(ppo_updates, 1)
+    metrics['train_clip_frac'] /= max(ppo_updates, 1)
+    metrics['train_grad_norm'] /= max(ppo_updates, 1)
     metrics['train_prior_std'] /= max(prior_updates, 1)
+    metrics['train_prior_mean'] /= max(prior_updates, 1)
+    metrics['train_prior_max'] /= max(prior_updates, 1)
+    metrics['train_stochastic_decisions'] /= max(replay_items, 1)
+    metrics['train_no_stochastic_frac'] /= max(replay_items, 1)
+    metrics['train_tau_cv'] /= max(replay_items, 1)
+    metrics['train_ppo_epochs_used'] = float(ppo_updates)
     return metrics
 
 
@@ -356,6 +458,7 @@ def infer_validation_instance(model, pyg_data, instance, n_ants: int, mode: str,
                 min_new_edges=kwargs['min_new_edges'],
                 device=DEVICE,
                 solver=solver,
+                edge_feature_mode=kwargs.get('edge_feature_mode', 'full'),
             )
             iter_prior = _prior_for_model(model, dynamic_pyg)
             routes = None
@@ -443,7 +546,14 @@ def resolve_run_name(args: argparse.Namespace) -> str:
     )
 
 
-def write_report(report_path: Path, args: argparse.Namespace, history: list[dict[str, Any]], best_epoch: int, best_value: float):
+def write_report(
+    report_path: Path,
+    args: argparse.Namespace,
+    history: list[dict[str, Any]],
+    best_epoch: int,
+    best_value: float,
+    stopped_reason: str = '',
+):
     report_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         commit = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], text=True).strip()
@@ -460,10 +570,17 @@ def write_report(report_path: Path, args: argparse.Namespace, history: list[dict
         f.write(f'- Best epoch: `{best_epoch}`\n')
         f.write(f'- Best selected metric: `{best_value:.6f}`\n')
         f.write(f'- Validation mode: `{args.val_infer_mode}`; selection mode: `{args.select_metric_mode}`\n\n')
+        if stopped_reason:
+            f.write(f'- Stopped early: `{stopped_reason}`\n\n')
         f.write('## Command\n\n')
         f.write('```powershell\nuv run .\\train_dynaco_ppo.py ' + ' '.join(os.sys.argv[1:]) + '\n```\n\n')
         f.write('## Per-Epoch Metrics\n\n')
-        diag_keys = ['train_loss', 'train_entropy', 'train_approx_kl', 'train_clip_frac', 'train_prior_std']
+        diag_keys = [
+            'train_loss', 'train_entropy', 'train_approx_kl', 'train_clip_frac',
+            'train_prior_mean', 'train_prior_std', 'train_prior_max', 'train_grad_norm',
+            'train_raw_adv_std', 'train_stochastic_decisions', 'train_no_stochastic_frac',
+            'train_tau_cv', 'train_ppo_epochs_used', 'lr',
+        ]
         headers = ['epoch', 'train_best_cost', 'train_mean_cost'] + diag_keys + val_keys
         f.write('| ' + ' | '.join(headers) + ' |\n')
         f.write('| ' + ' | '.join(['---'] * len(headers)) + ' |\n')
@@ -500,10 +617,14 @@ def train(args: argparse.Namespace):
         wandb.init(project='neufaco-cvrptw', name=args.run_name)
         wandb.config.update(vars(args))
 
-    model = Net(value_head=False).to(DEVICE)
+    model = Net(value_head=False, norm_type=args.norm_type).to(DEVICE)
     if args.pretrained:
         model.load_state_dict(torch.load(args.pretrained, map_location=DEVICE))
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1)) if args.lr_scheduler == 'cosine' else None
+    ema_state = None
+    if args.ema_decay > 0:
+        ema_state = {key: value.detach().clone() for key, value in model.state_dict().items()}
     val_list = load_val_dataset(args.nodes, args.cand_list_size, DEVICE, val_size=args.val_size)
     save_dir = Path(args.output) / str(args.nodes) / args.run_name
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -512,37 +633,65 @@ def train(args: argparse.Namespace):
     history = []
     best_value = math.inf
     best_epoch = -1
+    best_for_patience = math.inf
+    epochs_without_improvement = 0
+    stopped_reason = ''
     baseline_metrics = validate_model(None, val_list, args.val_ants, args.val_infer_mode, -1, **val_kwargs)
     history.append({'epoch': -1, 'train_best_cost': math.nan, 'train_mean_cost': math.nan, **baseline_metrics})
-    initial_metrics = validate_model(model, val_list, args.val_ants, args.val_infer_mode, 0, **val_kwargs)
+    initial_metrics = evaluate_with_optional_ema(
+        model,
+        ema_state,
+        lambda eval_model: validate_model(eval_model, val_list, args.val_ants, args.val_infer_mode, 0, **val_kwargs),
+    )
     history.append({'epoch': 0, 'train_best_cost': math.nan, 'train_mean_cost': math.nan, **initial_metrics})
     best_value = selected_metric(initial_metrics, args.select_metric_mode)
     best_epoch = 0
-    torch.save(model.state_dict(), save_dir / 'best.pt')
+    best_for_patience = best_value
+    torch.save(ema_state if ema_state is not None else model.state_dict(), save_dir / 'best.pt')
 
     for epoch in range(1, args.epochs + 1):
         epoch_metrics = []
         for step in tqdm(range(args.steps), desc='Train', dynamic_ncols=True):
             data = generate_traindata(args.batch_size, args.nodes, args.cand_list_size, seed=(epoch * args.steps + step) * args.batch_size)
             metrics = train_instance_dynaco(model, optimizer, data, args, epoch, step)
+            update_ema_state(ema_state, model, args.ema_decay)
             epoch_metrics.append(metrics)
         train_summary = {
             key: float(np.mean([m[key] for m in epoch_metrics]))
             for key in epoch_metrics[0]
         } if epoch_metrics else {'train_best_cost': math.nan, 'train_mean_cost': math.nan, 'train_loss': math.nan, 'train_entropy': math.nan}
-        val_metrics = validate_model(model, val_list, args.val_ants, args.val_infer_mode, epoch, **val_kwargs)
+        if scheduler is not None:
+            scheduler.step()
+        train_summary['lr'] = float(optimizer.param_groups[0]['lr'])
+        val_metrics = evaluate_with_optional_ema(
+            model,
+            ema_state,
+            lambda eval_model: validate_model(eval_model, val_list, args.val_ants, args.val_infer_mode, epoch, **val_kwargs),
+        )
         row = {'epoch': epoch, **train_summary, **val_metrics}
         history.append(row)
         current_value = selected_metric(val_metrics, args.select_metric_mode)
         if current_value < best_value:
             best_value = current_value
             best_epoch = epoch
-            torch.save(model.state_dict(), save_dir / 'best.pt')
-        torch.save(model.state_dict(), save_dir / f'epoch-{epoch}.pt')
+            torch.save(ema_state if ema_state is not None else model.state_dict(), save_dir / 'best.pt')
+        if current_value < best_for_patience - args.early_stop_min_delta:
+            best_for_patience = current_value
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+        torch.save(ema_state if ema_state is not None else model.state_dict(), save_dir / f'epoch-{epoch}.pt')
         if USE_WANDB:
             wandb.log(row, step=epoch)
-        write_report(Path(args.report_path), args, history, best_epoch, best_value)
-    write_report(Path(args.report_path), args, history, best_epoch, best_value)
+        if args.early_stop_patience > 0 and epochs_without_improvement >= args.early_stop_patience:
+            stopped_reason = (
+                f'no selected-metric improvement > {args.early_stop_min_delta:g} '
+                f'for {args.early_stop_patience} epochs'
+            )
+            write_report(Path(args.report_path), args, history, best_epoch, best_value, stopped_reason)
+            break
+        write_report(Path(args.report_path), args, history, best_epoch, best_value, stopped_reason)
+    write_report(Path(args.report_path), args, history, best_epoch, best_value, stopped_reason)
     return history
 
 
@@ -564,6 +713,13 @@ def parse_args():
     parser.add_argument('--entropy_coeff', type=float, default=0.0)
     parser.add_argument('--max_grad_norm', type=float, default=1.0)
     parser.add_argument('--no_adv_norm', action='store_true')
+    parser.add_argument('--advantage_mode', choices=['per_step', 'macro_relative'], default='per_step')
+    parser.add_argument('--adv_clip', type=float, default=0.0)
+    parser.add_argument('--target_kl', type=float, default=0.0)
+    parser.add_argument('--lr_scheduler', choices=['none', 'cosine'], default='none')
+    parser.add_argument('--ema_decay', type=float, default=0.0)
+    parser.add_argument('--norm_type', choices=['batch', 'layer'], default='batch')
+    parser.add_argument('--edge_feature_mode', choices=['full', 'static'], default='full')
     parser.add_argument('--train_H', type=int, default=1)
     parser.add_argument('--train_mini_H', type=int, default=4)
     parser.add_argument('--val_size', type=int, default=20)
@@ -596,6 +752,8 @@ def parse_args():
     parser.add_argument('--report_path', type=str, default='experiments/neural_DyNACO_report.md')
     parser.add_argument('--run_name', type=str, default='')
     parser.add_argument('--disable_wandb', action='store_true')
+    parser.add_argument('--early_stop_patience', type=int, default=0)
+    parser.add_argument('--early_stop_min_delta', type=float, default=0.0)
     return parser.parse_args()
 
 
