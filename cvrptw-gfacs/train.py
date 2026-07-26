@@ -393,7 +393,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.k_sparse is None:
-        args.k_sparse = args.nodes // 2
+        args.k_sparse = args.nodes // 5
     if args.nb_granular is None:
         args.nb_granular = args.nodes // 2
 
