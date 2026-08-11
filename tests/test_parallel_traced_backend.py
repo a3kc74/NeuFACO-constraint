@@ -1,15 +1,9 @@
-import sys
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "cvrptw-faco"))
-
 import unittest
 
 import numpy as np
 
-from faco import set_faco_cpp_threads
-from utils_ppo import build_solver, generate_cvrptw_instance
+from solvers.faco import set_faco_cpp_threads
+from envs.cvrptw_env import build_solver, generate_cvrptw_instance
 
 
 class ParallelTracedBackendTest(unittest.TestCase):

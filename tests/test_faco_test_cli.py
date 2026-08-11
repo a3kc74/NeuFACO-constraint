@@ -1,15 +1,11 @@
 import csv
-import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "cvrptw-faco"))
-
-from faco_test import main
-import faco_test
+from evaluation.faco_test import main
+from evaluation import faco_test
 
 
 def make_dataset(path: Path, n_nodes: int, n_instances: int, vrptw: bool = False):

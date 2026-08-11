@@ -1,5 +1,4 @@
 import csv
-import importlib.util
 from pathlib import Path
 from multiprocessing import Queue
 
@@ -10,12 +9,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def load_macs_test_module():
-    module_path = ROOT / "cvrptw-macs" / "test.py"
-    spec = importlib.util.spec_from_file_location("macs_test", module_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+    import baselines.macs_baseline as macs_test
+    return macs_test
 
 
 def make_dataset(path: Path, n_nodes: int, n_instances: int, vrptw: bool = False):

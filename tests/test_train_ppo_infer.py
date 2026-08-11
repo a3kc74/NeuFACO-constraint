@@ -1,16 +1,10 @@
-import sys
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "cvrptw-faco"))
-
 import unittest
 from unittest.mock import patch
 
 import numpy as np
 import torch
 
-import train_ppo
+import trainers.ppo_trainer as train_ppo
 
 
 class DummyPygData:

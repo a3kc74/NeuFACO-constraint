@@ -1,15 +1,9 @@
-import sys
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "cvrptw-faco"))
-
 import argparse
 import torch
 
-from net import Net
-from utils_ppo import load_val_dataset
-from train_ppo import infer_instance, DEVICE
+from models.faco_net import Net
+from envs.cvrptw_env import load_val_dataset
+from trainers.ppo_trainer import infer_instance, DEVICE
 
 
 if __name__ == '__main__':

@@ -1,14 +1,10 @@
 import math
-import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "cvrptw-faco"))
-
-from faco import MFACO_CVRPTW
+from solvers.faco import MFACO_CVRPTW
 
 
 def route_distance(coords, route):

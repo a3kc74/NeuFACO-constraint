@@ -1,8 +1,4 @@
-import sys
 from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "cvrptw-faco"))
 
 import tempfile
 import unittest
@@ -11,7 +7,7 @@ from pathlib import Path
 
 class DynACOGridRunnerTest(unittest.TestCase):
     def test_default_grid_contains_old_default_and_faco_test_only(self):
-        import run_dynaco_grid
+        from analysis import dynaco_grid as run_dynaco_grid
 
         configs = run_dynaco_grid.default_grid()
 
@@ -25,7 +21,7 @@ class DynACOGridRunnerTest(unittest.TestCase):
         self.assertNotIn('both', command)
 
     def test_parse_report_extracts_epoch0_final_and_best(self):
-        import run_dynaco_grid
+        from analysis import dynaco_grid as run_dynaco_grid
 
         with tempfile.TemporaryDirectory() as tmp:
             report = Path(tmp) / 'report.md'

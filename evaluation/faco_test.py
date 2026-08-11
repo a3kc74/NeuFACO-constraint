@@ -1,0 +1,817 @@
+from __future__ import annotations
+
+__test__ = False
+
+import argparse
+import csv
+import itertools
+import random
+import time
+from pathlib import Path
+from typing import Iterable
+
+import numpy as np
+import torch
+from tqdm import tqdm
+from torch_geometric.data import Data
+
+CURRENT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = CURRENT_DIR.parent
+
+from envs import cvrptw_env as ppo_utils
+from models.faco_net import Net as PPONet
+from models.gfacs_net import Net as OriginalGFACSNet
+from solvers.faco import MFACO_CVRPTW, set_faco_cpp_threads
+
+
+def dataset_mode_prefix(tam: bool = False, vrptw: bool = False) -> str:
+    if tam and vrptw:
+        return "tam-vrptw-"
+    if tam:
+        return "tam-"
+    if vrptw:
+        return "vrptw-"
+    return ""
+
+
+def default_data_dir() -> Path:
+    return ROOT_DIR / "data" / "cvrptw"
+
+
+def load_dataset(n_nodes: int, device: str, tam: bool = False, vrptw: bool = False,
+                 data_dir: str | Path | None = None):
+    base_dir = Path(data_dir) if data_dir is not None else default_data_dir()
+    filename = base_dir / f"testDataset-{dataset_mode_prefix(tam, vrptw)}{n_nodes}.pt"
+    if not filename.is_file():
+        raise FileNotFoundError(
+            f"File {filename} not found. Generate it with generate_data.py first."
+        )
+
+    dataset = torch.load(filename, map_location=device)
+    test_list = []
+    for i in range(len(dataset)):
+        demands = dataset[i, 0, :]
+        positions = dataset[i, 1:3, :].T
+        distances = dataset[i, 3:-2, :]
+        windows = dataset[i, -2:, :].T
+        test_list.append((demands, distances, positions, windows))
+    return test_list
+
+
+def _edge_key(u: int, v: int) -> int:
+    u = int(u)
+    v = int(v)
+    if u > v:
+        u, v = v, u
+    return (u << 32) | v
+
+
+def route_edges(route: Iterable[int]) -> set[int]:
+    nodes = [int(node) for node in route]
+    return {_edge_key(u, v) for u, v in zip(nodes[:-1], nodes[1:])}
+
+
+def route_diversity(routes) -> float:
+    if len(routes) < 2:
+        return 0.0
+    edge_sets = [route_edges(route) for route in routes]
+    total = 0.0
+    pairs = 0
+    for left, right in itertools.combinations(edge_sets, 2):
+        union = left | right
+        similarity = len(left & right) / len(union) if union else 1.0
+        total += similarity
+        pairs += 1
+    return 1.0 - total / pairs if pairs else 0.0
+
+def route_edge_distance(route_a, route_b) -> float:
+    edges_a = route_edges(route_a)
+    edges_b = route_edges(route_b)
+    return edge_set_distance(edges_a, edges_b)
+
+
+def edge_set_distance(edges_a, edges_b) -> float:
+    union = edges_a | edges_b
+    if not union:
+        return 0.0
+    return 1.0 - len(edges_a & edges_b) / len(union)
+
+
+def route_entry(route, cost, edges=None):
+    route = np.asarray(route, dtype=np.int32).copy()
+    return {"route": route, "cost": float(cost), "edges": route_edges(route) if edges is None else edges}
+
+
+def normalize_archive_entry(item):
+    return route_entry(item["route"], item["cost"], item.get("edges"))
+
+def update_elite_archive(
+    archive,
+    routes,
+    costs,
+    elite_k: int,
+    elite_min_diversity: float,
+    elite_cost_tolerance: float,
+    pinned_elite=None,
+):
+    if elite_k <= 0:
+        return []
+
+    candidates = [normalize_archive_entry(item) for item in archive]
+    if pinned_elite is not None:
+        pinned_elite = normalize_archive_entry(pinned_elite)
+        candidates.append(pinned_elite)
+
+    best_candidate_cost = min([float(item["cost"]) for item in candidates] + [float(np.min(costs))])
+    max_allowed_cost = best_candidate_cost * elite_cost_tolerance
+
+    for route, cost in zip(routes, costs):
+        cost = float(cost)
+        if cost <= max_allowed_cost:
+            candidates.append(route_entry(route, cost))
+
+    candidates.sort(key=lambda item: item["cost"])
+    diverse = []
+    if pinned_elite is not None:
+        diverse.append(pinned_elite)
+
+    for candidate in candidates:
+        if any(np.array_equal(candidate["route"], item["route"]) for item in diverse):
+            continue
+        if all(edge_set_distance(candidate["edges"], item["edges"]) >= elite_min_diversity for item in diverse):
+            diverse.append(candidate)
+        if len(diverse) >= elite_k:
+            break
+    return diverse
+
+def select_elite_source(archive, step: int):
+    if not archive:
+        return None
+    return archive[(step + 1) % len(archive)]
+
+
+def load_gfacs_prior_model(checkpoint_path: str | Path, device: str, guided_exploration: bool | None = None):
+    checkpoint_path = Path(checkpoint_path)
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"GFACS checkpoint {checkpoint_path} not found")
+
+    state_dict = torch.load(checkpoint_path, map_location=device)
+    if not isinstance(state_dict, dict):
+        raise RuntimeError(f"GFACS checkpoint {checkpoint_path} must contain a state_dict")
+
+    if guided_exploration is None:
+        z_bias = state_dict.get("Z_net.2.bias")
+        z_out_dim = int(z_bias.numel()) if z_bias is not None else 1
+    else:
+        z_out_dim = 2 if guided_exploration else 1
+    model = OriginalGFACSNet(gfn=True, Z_out_dim=z_out_dim).to(device)
+    model.load_state_dict(state_dict)
+    model.eval()
+    return model
+
+
+def gen_original_gfacs_pyg_data(demands, distances, windows, device: str, k_sparse: int):
+    demands = torch.as_tensor(demands, dtype=torch.float32, device=device)
+    distances = torch.as_tensor(distances, dtype=torch.float32, device=device)
+    windows = torch.as_tensor(windows, dtype=torch.float32, device=device)
+    n_nodes = int(demands.size(0))
+    k_sparse = min(int(k_sparse), max(1, n_nodes - 1))
+
+    temp_dists = distances.clone()
+    if n_nodes > 1:
+        eye = torch.eye(n_nodes - 1, dtype=torch.bool, device=device)
+        temp_dists[1:, 1:][eye] = 1e9
+        topk_values, topk_indices = torch.topk(temp_dists[1:, 1:], k=k_sparse, dim=1, largest=False)
+        edge_index_1 = torch.stack([
+            torch.repeat_interleave(torch.arange(n_nodes - 1, device=device), repeats=k_sparse),
+            torch.flatten(topk_indices),
+        ]) + 1
+        edge_attr_1 = topk_values.reshape(-1, 1)
+        edge_index_2 = torch.stack([
+            torch.zeros(n_nodes - 1, device=device, dtype=torch.long),
+            torch.arange(1, n_nodes, device=device, dtype=torch.long),
+        ])
+        edge_attr_2 = temp_dists[1:, 0].reshape(-1, 1)
+        edge_index_3 = torch.stack([
+            torch.arange(1, n_nodes, device=device, dtype=torch.long),
+            torch.zeros(n_nodes - 1, device=device, dtype=torch.long),
+        ])
+        edge_index = torch.concat([edge_index_1, edge_index_2, edge_index_3], dim=1)
+        edge_attr = torch.concat([edge_attr_1, edge_attr_2, edge_attr_2])
+    else:
+        edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+        edge_attr = torch.empty((0, 1), dtype=torch.float32, device=device)
+
+    x = torch.cat([demands.unsqueeze(1), windows], dim=-1)
+    return Data(x=x.float(), edge_attr=edge_attr.float(), edge_index=edge_index)
+
+
+def build_instance_for_prior(demands, distances, windows):
+    return {
+        "demand": demands,
+        "distances": distances,
+        "windows": windows,
+    }
+
+
+@torch.no_grad()
+def gfacs_prior(
+    model,
+    instance,
+    solver,
+    k_sparse: int,
+    device: str,
+    prior_scale: float = 1.0,
+    prior_center: bool = False,
+):
+    if model is None:
+        return None
+    pyg_data = gen_original_gfacs_pyg_data(
+        instance["demand"],
+        instance["distances"],
+        instance["windows"],
+        device=device,
+        k_sparse=k_sparse,
+    )
+    heuristic_mat = model.reshape(pyg_data, model(pyg_data))
+    nn_list = torch.as_tensor(np.asarray(solver.nn_list), dtype=torch.long, device=heuristic_mat.device)
+    rows = torch.arange(nn_list.shape[0], device=heuristic_mat.device).unsqueeze(1)
+    sparse_heuristic = heuristic_mat[rows, nn_list]
+    prior = torch.zeros_like(sparse_heuristic, dtype=torch.float32)
+    positive = sparse_heuristic > 0
+    prior[positive] = torch.log(sparse_heuristic[positive].to(torch.float32).clamp_min(1e-10))
+    if prior_center:
+        prior = prior - prior.mean(dim=1, keepdim=True)
+    if prior_scale != 1.0:
+        prior = prior * float(prior_scale)
+    return prior.detach().cpu().numpy().astype(np.float32, copy=False)
+
+
+
+
+def load_ppo_prior_model(checkpoint_path: str | Path, device: str, norm_type: str = "batch"):
+    checkpoint_path = Path(checkpoint_path)
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"PPO checkpoint {checkpoint_path} not found")
+    state_dict = torch.load(checkpoint_path, map_location=device)
+    if not isinstance(state_dict, dict):
+        raise RuntimeError(f"PPO checkpoint {checkpoint_path} must contain a state_dict")
+    model = PPONet(value_head=False, norm_type=norm_type).to(device)
+    model.load_state_dict(state_dict)
+    model.eval()
+    return model
+
+
+def build_ppo_instance_for_prior(demands, positions, windows):
+    return {
+        "coords": positions,
+        "demand": demands,
+        "windows": windows,
+        "capacity": 1.0,
+    }
+
+
+@torch.no_grad()
+def ppo_prior(
+    model,
+    instance,
+    solver,
+    cand_list_size: int,
+    backup_list_size: int,
+    n_ants: int,
+    min_new_edges: int,
+    device: str,
+    edge_feature_mode: str = "full",
+    prior_scale: float = 1.0,
+    prior_center: bool = False,
+):
+    if model is None:
+        return None
+    pyg_data = ppo_utils.gen_pyg_data(
+        instance,
+        cand_list_size=cand_list_size,
+        backup_list_size=backup_list_size,
+        n_ants=n_ants,
+        min_new_edges=min_new_edges,
+        solver=solver,
+        device=device,
+        edge_feature_mode=edge_feature_mode,
+    )
+    prior = model.reshape(pyg_data, model(pyg_data))
+    if prior_center:
+        prior = prior - prior.mean(dim=1, keepdim=True)
+    if prior_scale != 1.0:
+        prior = prior * float(prior_scale)
+    return prior.detach().cpu().numpy().astype(np.float32, copy=False)
+
+
+def sample_multisource(solver, archive, source_count: int, prior=None, prior_fn=None):
+    source_count = min(source_count, len(archive))
+    all_costs = []
+    all_routes = []
+    for source in archive[:source_count]:
+        solver.set_source_route(source["route"], source["cost"])
+        sample_prior = prior_fn() if prior_fn is not None else prior
+        costs, routes, *_ = solver.sample(prior=sample_prior)
+        all_costs.append(np.asarray(costs, dtype=np.float32))
+        all_routes.extend(np.asarray(route, dtype=np.int32) for route in routes)
+    return np.concatenate(all_costs), np.asarray(all_routes, dtype=object)
+
+
+def resolve_prior(prior=None, prior_fn=None):
+    return prior_fn() if prior_fn is not None else prior
+
+
+def infer_instance(
+    demands,
+    positions,
+    windows,
+    n_ants: int,
+    n_iter: int,
+    mini_H: int,
+    threads: int | None,
+    seed: int,
+    cand_list_size: int,
+    backup_list_size: int,
+    min_new_edges: int,
+    decay: float,
+    alpha: float,
+    p_best: float,
+    use_local_search: bool,
+    disable_heuristic: bool,
+    extend_ls: bool,
+    smooth_mmas: bool,
+    fixed_steps: int,
+    nls: bool,
+    T_nls: int,
+    elite_k: int = 8,
+    elite_min_diversity: float = 0.15,
+    elite_cost_tolerance: float = 1.05,
+    source_count: int = 2,
+    pin_global_best_elite: bool = False,
+    gfacs_model=None,
+    gfacs_k_sparse: int | None = None,
+    gfacs_device: str = "cpu",
+    gfacs_prior_scale: float = 1.0,
+    gfacs_prior_center: bool = False,
+    ppo_model=None,
+    ppo_device: str = "cpu",
+    ppo_edge_feature_mode: str = "full",
+    ppo_prior_refresh: str = "outer",
+    ppo_prior_scale: float = 1.0,
+    ppo_prior_center: bool = False,
+    distances=None,
+):
+    if mini_H < 1:
+        raise ValueError("mini_H must be >= 1")
+    if threads is not None and threads < 1:
+        raise ValueError("threads must be >= 1")
+
+    solver = MFACO_CVRPTW(
+        positions,
+        demands,
+        windows,
+        capacity=1.0,
+        n_ants=n_ants,
+        cand_list_size=cand_list_size,
+        backup_list_size=backup_list_size,
+        min_new_edges=min_new_edges,
+        decay=decay,
+        alpha=alpha,
+        p_best=p_best,
+        use_local_search=use_local_search,
+        disable_heuristic=disable_heuristic,
+        extend_ls=extend_ls,
+        smooth_mmas=smooth_mmas,
+        device="cpu",
+        fixed_steps=fixed_steps,
+        nls=nls,
+        T_nls=T_nls,
+    )
+    solver.seed_rng(seed)
+
+    results = torch.zeros(size=(n_iter,), dtype=torch.float32)
+    diversities = torch.zeros(size=(n_iter,), dtype=torch.float32)
+    best_so_far = float("inf")
+    global_best_route = None
+    elite_archive = []
+    if distances is None:
+        positions_tensor = torch.as_tensor(positions, dtype=torch.float32)
+        distances = torch.cdist(positions_tensor, positions_tensor)
+    gfacs_prior_instance = build_instance_for_prior(demands, distances, windows)
+    ppo_prior_instance = build_ppo_instance_for_prior(demands, positions, windows)
+    static_prior = gfacs_prior(
+        gfacs_model,
+        gfacs_prior_instance,
+        solver,
+        k_sparse=gfacs_k_sparse if gfacs_k_sparse is not None else cand_list_size,
+        device=gfacs_device,
+        prior_scale=gfacs_prior_scale,
+        prior_center=gfacs_prior_center,
+    )
+
+    def current_prior():
+        if ppo_model is not None:
+            return ppo_prior(
+                ppo_model,
+                ppo_prior_instance,
+                solver,
+                cand_list_size=cand_list_size,
+                backup_list_size=backup_list_size,
+                n_ants=n_ants,
+                min_new_edges=min_new_edges,
+                device=ppo_device,
+                edge_feature_mode=ppo_edge_feature_mode,
+                prior_scale=ppo_prior_scale,
+                prior_center=ppo_prior_center,
+            )
+        return static_prior
+
+    start = time.time()
+    for t in range(n_iter):
+        iter_prior = current_prior() if ppo_model is not None and ppo_prior_refresh == "outer" else static_prior
+        iter_prior_fn = current_prior if ppo_model is not None and ppo_prior_refresh == "sample" else None
+        routes = None
+        for _mini_t in range(mini_H):
+            if _mini_t == mini_H - 1 and len(elite_archive) > 1:
+                costs_np, routes = sample_multisource(
+                    solver,
+                    elite_archive,
+                    source_count,
+                    prior_fn=iter_prior_fn,
+                    prior=iter_prior,
+                )
+            else:
+                elite_source = select_elite_source(elite_archive, t) if _mini_t == mini_H - 1 else None
+                if elite_source is not None:
+                    solver.set_source_route(elite_source["route"], elite_source["cost"])
+                elif _mini_t == mini_H - 1 and global_best_route is not None:
+                    solver.set_source_route(global_best_route, best_so_far)
+                costs, routes, *_ = solver.sample(prior=resolve_prior(iter_prior, iter_prior_fn))
+                costs_np = np.asarray(costs, dtype=np.float32)
+            best_idx = int(np.argmin(costs_np))
+            best_cost = float(costs_np[best_idx])
+            best_route = np.asarray(routes[best_idx], dtype=np.int32)
+            if best_cost < best_so_far:
+                best_so_far = best_cost
+                global_best_route = best_route.copy()
+            pinned_elite = {"route": global_best_route, "cost": best_so_far} if pin_global_best_elite and global_best_route is not None else None
+            elite_archive = update_elite_archive(
+                elite_archive,
+                routes,
+                costs_np,
+                elite_k=elite_k,
+                elite_min_diversity=elite_min_diversity,
+                elite_cost_tolerance=elite_cost_tolerance,
+                pinned_elite=pinned_elite,
+            )
+        
+            solver.update_pheromone(best_route, best_cost)
+        results[t] = best_so_far
+        diversities[t] = route_diversity(routes)
+    elapsed = time.time() - start
+    return results, diversities, elapsed
+
+
+def test(dataset, n_ants: int, n_iter: int, mini_H: int, threads: int | None, seed: int, **solver_kwargs):
+    sum_results = torch.zeros(size=(n_iter,), dtype=torch.float32)
+    sum_diversities = torch.zeros(size=(n_iter,), dtype=torch.float32)
+    sum_times = 0.0
+
+    for idx, (demands, distances, positions, windows) in enumerate(tqdm(dataset, dynamic_ncols=True)):
+        results, diversities, elapsed_time = infer_instance(
+            demands=demands.cpu(),
+            distances=distances.cpu(),
+            positions=positions.cpu(),
+            windows=windows.cpu(),
+            n_ants=n_ants,
+            n_iter=n_iter,
+            mini_H=mini_H,
+            threads=threads,
+            seed=seed + idx,
+            **solver_kwargs,
+        )
+        sum_results += results
+        sum_diversities += diversities
+        sum_times += elapsed_time
+
+    return sum_results / len(dataset), sum_diversities / len(dataset), sum_times / len(dataset)
+
+
+def write_results(
+    result_txt: Path,
+    result_csv: Path,
+    problem_name: str,
+    n_nodes: int,
+    n_instances: int,
+    n_ants: int,
+    n_iter: int,
+    mini_H: int,
+    threads: int | None,
+    seed: int,
+    duration: float,
+    avg_cost,
+    avg_diversity,
+    checkpoint: str | None = None,
+    gfacs_device: str = "cpu",
+    gfacs_prior_scale: float = 1.0,
+    gfacs_prior_center: bool = False,
+    ppo_device: str = "cpu",
+    ppo_norm_type: str = "batch",
+    ppo_edge_feature_mode: str = "full",
+    ppo_prior_refresh: str = "outer",
+    ppo_prior_scale: float = 1.0,
+    ppo_prior_center: bool = False,
+):
+    result_txt.parent.mkdir(parents=True, exist_ok=True)
+    with result_txt.open("w") as f:
+        f.write(f"problem: {problem_name}\n")
+        f.write(f"problem scale: {n_nodes}\n")
+        f.write(f"checkpoint: {checkpoint if checkpoint is not None else 'none'}\n")
+        f.write(f"number of instances: {n_instances}\n")
+        f.write("device: cpu\n")
+        f.write(f"gfacs_device: {gfacs_device}\n")
+        f.write(f"gfacs_prior_scale: {gfacs_prior_scale}\n")
+        f.write(f"gfacs_prior_center: {gfacs_prior_center}\n")
+        f.write(f"ppo_device: {ppo_device}\n")
+        f.write(f"ppo_norm_type: {ppo_norm_type}\n")
+        f.write(f"ppo_edge_feature_mode: {ppo_edge_feature_mode}\n")
+        f.write(f"ppo_prior_refresh: {ppo_prior_refresh}\n")
+        f.write(f"ppo_prior_scale: {ppo_prior_scale}\n")
+        f.write(f"ppo_prior_center: {ppo_prior_center}\n")
+        f.write(f"n_ants: {n_ants}\n")
+        f.write(f"mini_H: {mini_H}\n")
+        f.write(f"threads: {threads if threads is not None else 'default'}\n")
+        f.write(f"seed: {seed}\n")
+        f.write(f"average inference time: {duration}\n")
+        for i in range(n_iter):
+            f.write(f"T={i + 1}, avg. cost {avg_cost[i]}, avg. diversity {avg_diversity[i]}\n")
+
+    with result_csv.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["T", "avg_cost", "avg_diversity"])
+        writer.writeheader()
+        for i in range(n_iter):
+            writer.writerow({"T": i + 1, "avg_cost": float(avg_cost[i]), "avg_diversity": float(avg_diversity[i])})
+
+
+def main(
+    n_nodes: int,
+    k_sparse: int | None = None,
+    size: int | None = None,
+    n_ants: int = 100,
+    n_iter: int = 10,
+    mini_H: int = 1,
+    threads: int | None = None,
+    seed: int = 0,
+    tam: bool = False,
+    vrptw: bool = False,
+    data_dir: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    cand_list_size: int | None = None,
+    backup_list_size: int = 64,
+    min_new_edges: int = 8,
+    decay: float = 0.9,
+    alpha: float = 1.0,
+    p_best: float = 0.05,
+    use_local_search: bool = True,
+    disable_heuristic: bool = False,
+    extend_ls: bool = False,
+    smooth_mmas: bool = False,
+    fixed_steps: int = 0,
+    nls: bool = False,
+    T_nls: int = 10,
+    elite_k: int = 8,
+    elite_min_diversity: float = 0.15,
+    elite_cost_tolerance: float = 1.05,
+    source_count: int = 2,
+    pin_global_best_elite: bool = False,
+    gfacs_pretrained: str | Path | None = None,
+    gfacs_device: str | None = None,
+    gfacs_prior_scale: float = 1.0,
+    gfacs_prior_center: bool = False,
+    ppo_pretrained: str | Path | None = None,
+    ppo_device: str | None = None,
+    ppo_norm_type: str = "batch",
+    ppo_edge_feature_mode: str = "full",
+    ppo_prior_refresh: str = "outer",
+    ppo_prior_scale: float = 1.0,
+    ppo_prior_center: bool = False,
+):
+    if mini_H < 1:
+        raise ValueError("mini_H must be >= 1")
+    if threads is not None and threads < 1:
+        raise ValueError("threads must be >= 1")
+    if threads is not None:
+        set_faco_cpp_threads(threads)
+    if gfacs_pretrained is not None and ppo_pretrained is not None:
+        raise ValueError("gfacs_pretrained and ppo_pretrained cannot be used together")
+
+    if k_sparse is None:
+        k_sparse = n_nodes // 5
+    if cand_list_size is None:
+        cand_list_size = min(n_nodes // 5, 32)
+    if gfacs_device is None:
+        gfacs_device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    if ppo_device is None:
+        ppo_device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    dataset = load_dataset(n_nodes, "cpu", tam=tam, vrptw=vrptw, data_dir=data_dir)
+    dataset = dataset[: (size or len(dataset))]
+    gfacs_model = load_gfacs_prior_model(gfacs_pretrained, gfacs_device) if gfacs_pretrained is not None else None
+    ppo_model = load_ppo_prior_model(ppo_pretrained, ppo_device, ppo_norm_type) if ppo_pretrained is not None else None
+    checkpoint_label = str(gfacs_pretrained) if gfacs_pretrained is not None else (str(ppo_pretrained) if ppo_pretrained is not None else None)
+    checkpoint_type = "gfacs" if gfacs_pretrained is not None else ("ppo" if ppo_pretrained is not None else "none")
+
+    problem_name = f"{'tam-' if tam else ''}{'vrptw' if vrptw else 'cvrptw'}"
+    print("problem:", problem_name)
+    print("problem scale:", n_nodes)
+    print("checkpoint:", checkpoint_label)
+    print("number of instances:", len(dataset))
+    print("device:", "cpu")
+    print("gfacs_device:", gfacs_device)
+    print("gfacs_prior_scale:", gfacs_prior_scale)
+    print("gfacs_prior_center:", gfacs_prior_center)
+    print("ppo_device:", ppo_device)
+    print("ppo_norm_type:", ppo_norm_type)
+    print("ppo_edge_feature_mode:", ppo_edge_feature_mode)
+    print("ppo_prior_refresh:", ppo_prior_refresh)
+    print("ppo_prior_scale:", ppo_prior_scale)
+    print("ppo_prior_center:", ppo_prior_center)
+    print("n_ants:", n_ants)
+    print("mini_H:", mini_H)
+    print("threads:", threads if threads is not None else "default")
+    print("seed:", seed)
+
+    avg_cost, avg_diversity, duration = test(
+        dataset,
+        n_ants=n_ants,
+        n_iter=n_iter,
+        mini_H=mini_H,
+        threads=threads,
+        seed=seed,
+        cand_list_size=cand_list_size,
+        backup_list_size=backup_list_size,
+        min_new_edges=min_new_edges,
+        decay=decay,
+        alpha=alpha,
+        p_best=p_best,
+        use_local_search=use_local_search,
+        disable_heuristic=disable_heuristic,
+        extend_ls=extend_ls,
+        smooth_mmas=smooth_mmas,
+        fixed_steps=fixed_steps,
+        nls=nls,
+        T_nls=T_nls,
+        elite_k=elite_k,
+        elite_min_diversity=elite_min_diversity,
+        elite_cost_tolerance=elite_cost_tolerance,
+        source_count=source_count,
+        pin_global_best_elite=pin_global_best_elite,
+        gfacs_model=gfacs_model,
+        gfacs_k_sparse=k_sparse,
+        gfacs_device=gfacs_device,
+        gfacs_prior_scale=gfacs_prior_scale,
+        gfacs_prior_center=gfacs_prior_center,
+        ppo_model=ppo_model,
+        ppo_device=ppo_device,
+        ppo_edge_feature_mode=ppo_edge_feature_mode,
+        ppo_prior_refresh=ppo_prior_refresh,
+        ppo_prior_scale=ppo_prior_scale,
+        ppo_prior_center=ppo_prior_center,
+    )
+
+    print("average inference time: ", duration)
+    for i in range(n_iter):
+        print(f"T={i + 1}, avg. cost {avg_cost[i]}, avg. diversity {avg_diversity[i]}")
+
+    out_dir = Path(output_dir) if output_dir is not None else ROOT_DIR / "pretrained" / "cvrptw" / str(n_nodes) / "faco"
+    result_filename = (
+        f"test_result_ckpt{checkpoint_type}-{problem_name}{n_nodes}-ninst{size}-"
+        f"nants{n_ants}-niter{n_iter}-miniH{mini_H}-threads{threads if threads is not None else 'default'}-seed{seed}-faco"
+    )
+    result_txt = out_dir / f"{result_filename}.txt"
+    result_csv = out_dir / f"{result_filename}.csv"
+    write_results(
+        result_txt=result_txt,
+        result_csv=result_csv,
+        problem_name=problem_name,
+        n_nodes=n_nodes,
+        n_instances=len(dataset),
+        n_ants=n_ants,
+        n_iter=n_iter,
+        mini_H=mini_H,
+        threads=threads,
+        seed=seed,
+        duration=duration,
+        avg_cost=avg_cost,
+        avg_diversity=avg_diversity,
+        checkpoint=checkpoint_label,
+        gfacs_device=gfacs_device,
+        gfacs_prior_scale=gfacs_prior_scale,
+        gfacs_prior_center=gfacs_prior_center,
+        ppo_device=ppo_device,
+        ppo_norm_type=ppo_norm_type,
+        ppo_edge_feature_mode=ppo_edge_feature_mode,
+        ppo_prior_refresh=ppo_prior_refresh,
+        ppo_prior_scale=ppo_prior_scale,
+        ppo_prior_center=ppo_prior_center,
+    )
+    return avg_cost, avg_diversity, duration, result_txt, result_csv
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Test MFACO_CVRPTW on GFACS-format datasets.")
+    parser.add_argument("nodes", type=int, help="Problem scale")
+    parser.add_argument("-k", "--k_sparse", type=int, default=None, help="k_sparse / default FACO candidate list size")
+    parser.add_argument("-i", "--n_iter", type=int, default=10, help="Number of FACO iterations")
+    parser.add_argument("--mini_H", type=int, default=1, help="Number of FACO mini-iterations per outer iteration")
+    parser.add_argument("--threads", type=int, default=None, help="OpenMP thread count for parallel C++ FACO sampling/update")
+    parser.add_argument("-n", "--n_ants", type=int, default=100, help="Number of ants")
+    parser.add_argument("-s", "--size", type=int, default=None, help="Number of instances to test")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed")
+    parser.add_argument("--tam", action="store_true", help="Use TAM dataset")
+    parser.add_argument("--vrptw", action="store_true", help="Use VRPTW dataset with zero customer demands")
+    parser.add_argument("--data_dir", type=Path, default=None, help="Directory containing GFACS-format testDataset-*.pt files")
+    parser.add_argument("--output_dir", type=Path, default=None, help="Directory for result txt/csv files")
+
+    parser.add_argument("--cand_list_size", type=int, default=None, help="FACO candidate list size; defaults to k_sparse")
+    parser.add_argument("--backup_list_size", type=int, default=64, help="FACO backup list size")
+    parser.add_argument("--min_new_edges", type=int, default=8, help="FACO min_new_edges")
+    parser.add_argument("--decay", type=float, default=0.9, help="FACO pheromone decay")
+    parser.add_argument("--alpha", type=float, default=1.0, help="FACO pheromone exponent")
+    parser.add_argument("--p_best", type=float, default=0.05, help="FACO p_best")
+    parser.add_argument("--disable_local_search", action="store_true", help="Disable FACO local search")
+    parser.add_argument("--disable_heuristic", action="store_true", help="Disable FACO distance heuristic")
+    parser.add_argument("--extend_ls", action="store_true", help="Enable extended local search checklist")
+    parser.add_argument("--smooth_mmas", action="store_true", help="Enable smooth MMAS trail limits")
+    parser.add_argument("--fixed_steps", type=int, default=0, help="Fixed sampler steps; 0 means default")
+    parser.add_argument("--nls", action="store_true", help="Enable NLS mode")
+    parser.add_argument("--T_nls", type=int, default=10, help="Number of NLS iterations")
+    parser.add_argument("--elite_k", type=int, default=8, help="Number of quality-diverse elite source routes")
+    parser.add_argument("--elite_min_diversity", type=float, default=0.15, help="Minimum edge distance between elite source routes")
+    parser.add_argument("--elite_cost_tolerance", type=float, default=1.05, help="Maximum elite source cost ratio versus current best")
+    parser.add_argument("--source_count", type=int, default=2, help="Number of elite source routes used by final-mini multisource sampling")
+    parser.add_argument("--pin_global_best_elite", action="store_true", help="Always keep global best as one elite archive route")
+    parser.add_argument("--gfacs_pretrained", type=Path, default=None, help="Path to GFACS checkpoint used to generate sampling prior")
+    parser.add_argument("--gfacs_device", type=str, default=None, help="Device for GFACS prior computation; defaults to cuda:0 if available else cpu")
+    parser.add_argument("--gfacs_prior_scale", type=float, default=1.0, help="Multiplier applied to GFACS prior logits before sampling")
+    parser.add_argument("--gfacs_prior_center", action="store_true", help="Row-center GFACS prior logits before scaling")
+    parser.add_argument("--ppo_pretrained", type=Path, default=None, help="Path to train_dynaco_ppo.py checkpoint used to generate dynamic sampling prior")
+    parser.add_argument("--ppo_device", type=str, default=None, help="Device for PPO prior computation; defaults to cuda:0 if available else cpu")
+    parser.add_argument("--ppo_norm_type", type=str, choices=["batch", "layer"], default="batch", help="PPO Net normalization type used by checkpoint")
+    parser.add_argument("--ppo_edge_feature_mode", type=str, choices=["full", "static"], default="full", help="Edge features for PPO prior graph")
+    parser.add_argument("--ppo_prior_refresh", type=str, choices=["outer", "sample"], default="outer", help="When to recompute PPO prior; outer matches train_dynaco_ppo.py validation")
+    parser.add_argument("--ppo_prior_scale", type=float, default=1.0, help="Multiplier applied to PPO prior logits before sampling")
+    parser.add_argument("--ppo_prior_center", action="store_true", help="Row-center PPO prior logits before scaling")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    main(
+        n_nodes=args.nodes,
+        k_sparse=args.k_sparse,
+        size=args.size,
+        n_ants=args.n_ants,
+        n_iter=args.n_iter,
+        mini_H=args.mini_H,
+        threads=args.threads,
+        seed=args.seed,
+        tam=args.tam,
+        vrptw=args.vrptw,
+        data_dir=args.data_dir,
+        output_dir=args.output_dir,
+        cand_list_size=args.cand_list_size,
+        backup_list_size=args.backup_list_size,
+        min_new_edges=args.min_new_edges,
+        decay=args.decay,
+        alpha=args.alpha,
+        p_best=args.p_best,
+        use_local_search=not args.disable_local_search,
+        disable_heuristic=args.disable_heuristic,
+        extend_ls=args.extend_ls,
+        smooth_mmas=args.smooth_mmas,
+        fixed_steps=args.fixed_steps,
+        nls=args.nls,
+        T_nls=args.T_nls,
+        elite_k=args.elite_k,
+        elite_min_diversity=args.elite_min_diversity,
+        elite_cost_tolerance=args.elite_cost_tolerance,
+        source_count=args.source_count,
+        pin_global_best_elite=args.pin_global_best_elite,
+        gfacs_pretrained=args.gfacs_pretrained,
+        gfacs_device=args.gfacs_device,
+        gfacs_prior_scale=args.gfacs_prior_scale,
+        gfacs_prior_center=args.gfacs_prior_center,
+        ppo_pretrained=args.ppo_pretrained,
+        ppo_device=args.ppo_device,
+        ppo_norm_type=args.ppo_norm_type,
+        ppo_edge_feature_mode=args.ppo_edge_feature_mode,
+        ppo_prior_refresh=args.ppo_prior_refresh,
+        ppo_prior_scale=args.ppo_prior_scale,
+        ppo_prior_center=args.ppo_prior_center,
+    )

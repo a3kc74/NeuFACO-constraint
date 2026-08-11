@@ -1,9 +1,3 @@
-import sys
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "cvrptw-faco"))
-
 import math
 import unittest
 from unittest.mock import patch
@@ -22,7 +16,7 @@ class DummyTrace:
 
 class DyNACOReplayTest(unittest.TestCase):
     def test_replay_logp_uses_tau_eta_prior_and_valid_mask(self):
-        import train_dynaco_ppo
+        import trainers.dynaco_ppo_trainer as train_dynaco_ppo
 
         tau = torch.ones((2, 2), dtype=torch.float32)
         eta = torch.ones((2, 2), dtype=torch.float32)
@@ -39,7 +33,7 @@ class DyNACOReplayTest(unittest.TestCase):
 
 class DyNACOValidationModeTest(unittest.TestCase):
     def test_both_validation_modes_are_reported_separately(self):
-        import train_dynaco_ppo
+        import trainers.dynaco_ppo_trainer as train_dynaco_ppo
 
         val_list = [(object(), {'coords': [], 'demand': [], 'windows': [], 'capacity': 1.0})]
 

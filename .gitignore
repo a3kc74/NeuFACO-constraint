@@ -1,4 +1,6 @@
 __pycache__/
+**/__pycache__/
+*.py[cod]
 .venv/
 .vscode
 data/
@@ -8,6 +10,19 @@ pyvrp/
 pretrained/
 concorde/
 .tmp/
+**/.pytest_cache/
+**/build/
+**/*.egg-info/
+*.pyd
+*.so
+*.o
+*.obj
+*.exp
+*.lib
+texput.log
+*_results.csv
+*_results.md
+*_summary.md
 
 api.txt
 .agents
@@ -16,3 +31,4 @@ api.txt
 uv.lock
 
 experiments/
+**/experiments/*_ckpt/
