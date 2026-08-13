@@ -123,8 +123,9 @@ def gen_pyg_data(demands, distances, windows, device, k_sparse):
     return pyg_data
 
 
-def load_test_dataset(n_node, k_sparse, device, tam=False, vrptw=False):
-    filename = f"../data/cvrptw/testDataset-{dataset_mode_prefix(tam, vrptw)}{n_node}.pt"
+def load_test_dataset(n_node, k_sparse, device, tam=False, vrptw=False, data_dir=None):
+    base_dir = data_dir if data_dir is not None else "../data/cvrptw"
+    filename = os.path.join(base_dir, f"testDataset-{dataset_mode_prefix(tam, vrptw)}{n_node}.pt")
     if not os.path.isfile(filename):
         raise FileNotFoundError(
             f"File {filename} not found, please download the test dataset from the original repository."

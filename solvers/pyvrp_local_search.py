@@ -26,7 +26,7 @@ def make_data(positions: np.ndarray, demands: np.ndarray, windows: np.ndarray, d
             VehicleType(len(positions) - 1, capacity, 0, name=",".join(map(str, range(1, len(positions)))))
         ],
         distance_matrix=distances,
-        duration_matrix=np.zeros_like(distances),
+        duration_matrix=distances,
     )
 
 

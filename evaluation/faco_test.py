@@ -6,6 +6,7 @@ import argparse
 import csv
 import itertools
 import random
+import sys
 import time
 from pathlib import Path
 from typing import Iterable
@@ -14,6 +15,13 @@ import numpy as np
 import torch
 from tqdm import tqdm
 from torch_geometric.data import Data
+from utils import (
+    dataset_mode_prefix,
+    default_data_dir,
+    load_dataset,
+    load_rl4co_dataset,
+    normalize_dataset_item,
+)
 
 CURRENT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = CURRENT_DIR.parent
@@ -22,40 +30,6 @@ from envs import cvrptw_env as ppo_utils
 from models.faco_net import Net as PPONet
 from models.gfacs_net import Net as OriginalGFACSNet
 from solvers.faco import MFACO_CVRPTW, set_faco_cpp_threads
-
-
-def dataset_mode_prefix(tam: bool = False, vrptw: bool = False) -> str:
-    if tam and vrptw:
-        return "tam-vrptw-"
-    if tam:
-        return "tam-"
-    if vrptw:
-        return "vrptw-"
-    return ""
-
-
-def default_data_dir() -> Path:
-    return ROOT_DIR / "data" / "cvrptw"
-
-
-def load_dataset(n_nodes: int, device: str, tam: bool = False, vrptw: bool = False,
-                 data_dir: str | Path | None = None):
-    base_dir = Path(data_dir) if data_dir is not None else default_data_dir()
-    filename = base_dir / f"testDataset-{dataset_mode_prefix(tam, vrptw)}{n_nodes}.pt"
-    if not filename.is_file():
-        raise FileNotFoundError(
-            f"File {filename} not found. Generate it with generate_data.py first."
-        )
-
-    dataset = torch.load(filename, map_location=device)
-    test_list = []
-    for i in range(len(dataset)):
-        demands = dataset[i, 0, :]
-        positions = dataset[i, 1:3, :].T
-        distances = dataset[i, 3:-2, :]
-        windows = dataset[i, -2:, :].T
-        test_list.append((demands, distances, positions, windows))
-    return test_list
 
 
 def _edge_key(u: int, v: int) -> int:
@@ -266,7 +240,7 @@ def build_ppo_instance_for_prior(demands, positions, windows):
     return {
         "coords": positions,
         "demand": demands,
-        "windows": windows,
+        "windows": windows,args
         "capacity": 1.0,
     }
 
@@ -361,6 +335,7 @@ def infer_instance(
     ppo_prior_scale: float = 1.0,
     ppo_prior_center: bool = False,
     distances=None,
+    cost_evaluator=None,
 ):
     if mini_H < 1:
         raise ValueError("mini_H must be >= 1")
@@ -467,7 +442,10 @@ def infer_instance(
             )
         
             solver.update_pheromone(best_route, best_cost)
-        results[t] = best_so_far
+        if cost_evaluator is not None and global_best_route is not None:
+            results[t] = float(cost_evaluator([global_best_route])[0])
+        else:
+            results[t] = best_so_far
         diversities[t] = route_diversity(routes)
     elapsed = time.time() - start
     return results, diversities, elapsed
@@ -478,12 +456,14 @@ def test(dataset, n_ants: int, n_iter: int, mini_H: int, threads: int | None, se
     sum_diversities = torch.zeros(size=(n_iter,), dtype=torch.float32)
     sum_times = 0.0
 
-    for idx, (demands, distances, positions, windows) in enumerate(tqdm(dataset, dynamic_ncols=True)):
+    for idx, item in enumerate(tqdm(dataset, dynamic_ncols=True)):
+        demands, distances, positions, windows, cost_evaluator = normalize_dataset_item(item)
         results, diversities, elapsed_time = infer_instance(
             demands=demands.cpu(),
             distances=distances.cpu(),
             positions=positions.cpu(),
             windows=windows.cpu(),
+            cost_evaluator=cost_evaluator,
             n_ants=n_ants,
             n_iter=n_iter,
             mini_H=mini_H,
@@ -512,6 +492,11 @@ def write_results(
     duration: float,
     avg_cost,
     avg_diversity,
+    data_source: str = "gfacs",
+    rl4co_phase: str = "test",
+    rl4co_file: str | Path | None = None,
+    rl4co_seed: int = 1234,
+    rl4co_scale: bool = False,
     checkpoint: str | None = None,
     gfacs_device: str = "cpu",
     gfacs_prior_scale: float = 1.0,
@@ -529,6 +514,12 @@ def write_results(
         f.write(f"problem scale: {n_nodes}\n")
         f.write(f"checkpoint: {checkpoint if checkpoint is not None else 'none'}\n")
         f.write(f"number of instances: {n_instances}\n")
+        f.write(f"data_source: {data_source}\n")
+        if data_source == "rl4co":
+            f.write(f"rl4co_phase: {rl4co_phase}\n")
+            f.write(f"rl4co_file: {rl4co_file if rl4co_file is not None else 'default/generated'}\n")
+            f.write(f"rl4co_seed: {rl4co_seed}\n")
+            f.write(f"rl4co_scale: {rl4co_scale}\n")
         f.write("device: cpu\n")
         f.write(f"gfacs_device: {gfacs_device}\n")
         f.write(f"gfacs_prior_scale: {gfacs_prior_scale}\n")
@@ -565,7 +556,13 @@ def main(
     seed: int = 0,
     tam: bool = False,
     vrptw: bool = False,
+    data_source: str = "gfacs",
     data_dir: str | Path | None = None,
+    rl4co_root: str | Path | None = None,
+    rl4co_phase: str = "test",
+    rl4co_file: str | Path | None = None,
+    rl4co_seed: int = 1234,
+    rl4co_scale: bool = False,
     output_dir: str | Path | None = None,
     cand_list_size: int | None = None,
     backup_list_size: int = 64,
@@ -619,8 +616,24 @@ def main(
     np.random.seed(seed)
     random.seed(seed)
 
-    dataset = load_dataset(n_nodes, "cpu", tam=tam, vrptw=vrptw, data_dir=data_dir)
-    dataset = dataset[: (size or len(dataset))]
+    if data_source == "rl4co":
+        if vrptw:
+            raise ValueError("RL4CO data source is available for CVRPTW only")
+        if tam:
+            raise ValueError("RL4CO data source does not support TAM datasets")
+        dataset = load_rl4co_dataset(
+            n_nodes=n_nodes,
+            size=size,
+            phase=rl4co_phase,
+            filename=rl4co_file,
+            data_dir=data_dir,
+            rl4co_root=rl4co_root,
+            seed=rl4co_seed,
+            scale=rl4co_scale,
+        )
+    else:
+        dataset = load_dataset(n_nodes, "cpu", tam=tam, vrptw=vrptw, data_dir=data_dir)
+        dataset = dataset[: (size or len(dataset))]
     gfacs_model = load_gfacs_prior_model(gfacs_pretrained, gfacs_device) if gfacs_pretrained is not None else None
     ppo_model = load_ppo_prior_model(ppo_pretrained, ppo_device, ppo_norm_type) if ppo_pretrained is not None else None
     checkpoint_label = str(gfacs_pretrained) if gfacs_pretrained is not None else (str(ppo_pretrained) if ppo_pretrained is not None else None)
@@ -631,6 +644,12 @@ def main(
     print("problem scale:", n_nodes)
     print("checkpoint:", checkpoint_label)
     print("number of instances:", len(dataset))
+    print("data_source:", data_source)
+    if data_source == "rl4co":
+        print("rl4co_phase:", rl4co_phase)
+        print("rl4co_file:", rl4co_file if rl4co_file is not None else "default/generated")
+        print("rl4co_seed:", rl4co_seed)
+        print("rl4co_scale:", rl4co_scale)
     print("device:", "cpu")
     print("gfacs_device:", gfacs_device)
     print("gfacs_prior_scale:", gfacs_prior_scale)
@@ -690,7 +709,7 @@ def main(
 
     out_dir = Path(output_dir) if output_dir is not None else ROOT_DIR / "pretrained" / "cvrptw" / str(n_nodes) / "faco"
     result_filename = (
-        f"test_result_ckpt{checkpoint_type}-{problem_name}{n_nodes}-ninst{size}-"
+        f"test_result_ckpt{checkpoint_type}-{data_source}-{problem_name}{n_nodes}-ninst{size}-"
         f"nants{n_ants}-niter{n_iter}-miniH{mini_H}-threads{threads if threads is not None else 'default'}-seed{seed}-faco"
     )
     result_txt = out_dir / f"{result_filename}.txt"
@@ -709,6 +728,11 @@ def main(
         duration=duration,
         avg_cost=avg_cost,
         avg_diversity=avg_diversity,
+        data_source=data_source,
+        rl4co_phase=rl4co_phase,
+        rl4co_file=rl4co_file,
+        rl4co_seed=rl4co_seed,
+        rl4co_scale=rl4co_scale,
         checkpoint=checkpoint_label,
         gfacs_device=gfacs_device,
         gfacs_prior_scale=gfacs_prior_scale,
@@ -735,7 +759,13 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument("--tam", action="store_true", help="Use TAM dataset")
     parser.add_argument("--vrptw", action="store_true", help="Use VRPTW dataset with zero customer demands")
+    parser.add_argument("--data_source", type=str, default="gfacs", choices=["gfacs", "rl4co"], help="Dataset and metric source")
     parser.add_argument("--data_dir", type=Path, default=None, help="Directory containing GFACS-format testDataset-*.pt files")
+    parser.add_argument("--rl4co_root", type=Path, default=None, help="Path to the RL4CO repository if it is not installed")
+    parser.add_argument("--rl4co_phase", type=str, default="test", choices=["train", "val", "test"], help="RL4CO dataset phase")
+    parser.add_argument("--rl4co_file", type=Path, default=None, help="Optional RL4CO .npz dataset file")
+    parser.add_argument("--rl4co_seed", type=int, default=1234, help="Seed used when RL4CO generates data")
+    parser.add_argument("--rl4co_scale", action="store_true", help="Use RL4CO CVRPTW scaled generator")
     parser.add_argument("--output_dir", type=Path, default=None, help="Directory for result txt/csv files")
 
     parser.add_argument("--cand_list_size", type=int, default=None, help="FACO candidate list size; defaults to k_sparse")
@@ -783,7 +813,13 @@ if __name__ == "__main__":
         seed=args.seed,
         tam=args.tam,
         vrptw=args.vrptw,
+        data_source=args.data_source,
         data_dir=args.data_dir,
+        rl4co_root=args.rl4co_root,
+        rl4co_phase=args.rl4co_phase,
+        rl4co_file=args.rl4co_file,
+        rl4co_seed=args.rl4co_seed,
+        rl4co_scale=args.rl4co_scale,
         output_dir=args.output_dir,
         cand_list_size=args.cand_list_size,
         backup_list_size=args.backup_list_size,

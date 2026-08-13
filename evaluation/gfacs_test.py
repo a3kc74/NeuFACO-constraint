@@ -1,5 +1,6 @@
 import os
 import random
+from pathlib import Path
 
 __test__ = False
 
@@ -11,6 +12,9 @@ import torch
 from models.gfacs_net import Net
 from solvers.gfacs_aco import ACO
 from envs.gfacs_data import load_test_dataset
+from utils import load_rl4co_dataset, normalize_dataset_item
+
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 EPS = 1e-10
@@ -21,7 +25,16 @@ ACOALG = "AS"
 
 @torch.no_grad()
 def infer_instance(
-    model, pyg_data, demands, distances, positions, windows, n_ants, t_aco_diff, local_search_params=None
+    model,
+    pyg_data,
+    demands,
+    distances,
+    positions,
+    windows,
+    n_ants,
+    t_aco_diff,
+    local_search_params=None,
+    cost_evaluator=None,
 ):
     if model is not None:
         model.eval()
@@ -50,6 +63,12 @@ def infer_instance(
     elapsed_time = 0
     for i, t in enumerate(t_aco_diff):
         results[i], diversities[i], t = aco.run(t)
+        if cost_evaluator is not None and aco.shortest_path is not None:
+            route = aco.shortest_path.detach().cpu().numpy()
+            try:
+                results[i] = float(cost_evaluator([route])[0])
+            except AssertionError:
+                results[i] = float("inf")
         elapsed_time += t
     return results, diversities, elapsed_time
 
@@ -62,9 +81,24 @@ def test(dataset, model, n_ants, t_aco, local_search_params):
     sum_results = torch.zeros(size=(len(t_aco_diff),))
     sum_diversities = torch.zeros(size=(len(t_aco_diff),))
     sum_times = 0
-    for pyg_data, demands, distances, positions, windows in tqdm(dataset, dynamic_ncols=True):
+    for item in tqdm(dataset, dynamic_ncols=True):
+        if isinstance(item, dict):
+            demands, distances, positions, windows, cost_evaluator = normalize_dataset_item(item)
+            pyg_data = None
+        else:
+            pyg_data, demands, distances, positions, windows = item
+            cost_evaluator = None
         results, diversities, elapsed_time = infer_instance(
-            model, pyg_data, demands, distances, positions, windows, n_ants, t_aco_diff, local_search_params
+            model,
+            pyg_data,
+            demands,
+            distances,
+            positions,
+            windows,
+            n_ants,
+            t_aco_diff,
+            local_search_params,
+            cost_evaluator,
         )
         sum_results += results
         sum_diversities += diversities
@@ -96,9 +130,39 @@ def main(
     local_search_params=None,
     vrptw=False,
     deepaco=False,
+    data_source="gfacs",
+    data_dir=None,
+    rl4co_root=None,
+    rl4co_phase="test",
+    rl4co_file=None,
+    rl4co_seed=1234,
+    rl4co_scale=False,
 ):
-    test_list = load_test_dataset(n_nodes, k_sparse, DEVICE, TAM, vrptw=vrptw)
-    test_list = test_list[:(size or len(test_list))]
+    if data_source == "rl4co":
+        if vrptw:
+            raise ValueError("RL4CO data source is available for CVRPTW only")
+        if TAM:
+            raise ValueError("RL4CO data source does not support TAM datasets")
+        test_list = load_rl4co_dataset(
+            n_nodes=n_nodes,
+            size=size,
+            phase=rl4co_phase,
+            filename=rl4co_file,
+            data_dir=data_dir,
+            rl4co_root=rl4co_root,
+            seed=rl4co_seed,
+            scale=rl4co_scale,
+        )
+    else:
+        test_list = load_test_dataset(
+            n_nodes,
+            k_sparse,
+            DEVICE,
+            TAM,
+            vrptw=vrptw,
+            data_dir=str(data_dir) if data_dir is not None else os.path.join(ROOT_DIR, "data", "cvrptw"),
+        )
+        test_list = test_list[:(size or len(test_list))]
 
     t_aco = list(range(1, n_iter + 1))
     problem_name = f"{'tam-' if TAM else ''}{'vrptw' if vrptw else 'cvrptw'}"
@@ -106,6 +170,12 @@ def main(
     print("problem scale:", n_nodes)
     print("checkpoint:", ckpt_path)
     print("number of instances:", size)
+    print("data_source:", data_source)
+    if data_source == "rl4co":
+        print("rl4co_phase:", rl4co_phase)
+        print("rl4co_file:", rl4co_file if rl4co_file is not None else "default/generated")
+        print("rl4co_seed:", rl4co_seed)
+        print("rl4co_scale:", rl4co_scale)
     print("device:", 'cpu' if DEVICE == 'cpu' else DEVICE+"+cpu" )
     print("n_ants:", n_ants)
     print("seed:", seed)
@@ -119,16 +189,22 @@ def main(
 
     # Save result in directory that contains model_file
     filename = os.path.splitext(os.path.basename(ckpt_path))[0] if ckpt_path is not None else 'none'
-    dirname = os.path.dirname(ckpt_path) if ckpt_path is not None else f'../pretrained/cvrptw/{args.nodes}/no_model'
+    dirname = os.path.dirname(ckpt_path) if ckpt_path is not None else os.path.join(ROOT_DIR, 'pretrained', 'cvrptw', str(n_nodes), 'no_model')
     os.makedirs(dirname, exist_ok=True)
 
-    result_filename = f"test_result_ckpt{filename}-{problem_name}{n_nodes}-ninst{size}-nants{n_ants}-niter{n_iter}-seed{seed}"
+    result_filename = f"test_result_ckpt{filename}-{data_source}-{problem_name}{n_nodes}-ninst{size}-nants{n_ants}-niter{n_iter}-seed{seed}"
     result_file = os.path.join(dirname, result_filename + ".txt")
     with open(result_file, "w") as f:
         f.write(f"problem: {problem_name}\n")
         f.write(f"problem scale: {n_nodes}\n")
         f.write(f"checkpoint: {ckpt_path}\n")
         f.write(f"number of instances: {len(test_list)}\n")
+        f.write(f"data_source: {data_source}\n")
+        if data_source == "rl4co":
+            f.write(f"rl4co_phase: {rl4co_phase}\n")
+            f.write(f"rl4co_file: {rl4co_file if rl4co_file is not None else 'default/generated'}\n")
+            f.write(f"rl4co_seed: {rl4co_seed}\n")
+            f.write(f"rl4co_scale: {rl4co_scale}\n")
         f.write(f"device: {'cpu' if DEVICE == 'cpu' else DEVICE+'+cpu'}\n")
         f.write(f"n_ants: {n_ants}\n")
         f.write(f"seed: {seed}\n")
@@ -163,6 +239,13 @@ if __name__ == "__main__":
     ### Dataset
     parser.add_argument("--tam", action="store_true", help="Use TAM dataset")
     parser.add_argument("--vrptw", action="store_true", help="Use VRPTW data with all customer demands set to zero")
+    parser.add_argument("--data_source", type=str, default="gfacs", choices=["gfacs", "rl4co"], help="Dataset and metric source")
+    parser.add_argument("--data_dir", type=Path, default=None, help="Dataset directory")
+    parser.add_argument("--rl4co_root", type=Path, default=None, help="Path to the RL4CO repository if it is not installed")
+    parser.add_argument("--rl4co_phase", type=str, default="test", choices=["train", "val", "test"], help="RL4CO dataset phase")
+    parser.add_argument("--rl4co_file", type=Path, default=None, help="Optional RL4CO .npz dataset file")
+    parser.add_argument("--rl4co_seed", type=int, default=1234, help="Seed used when RL4CO generates data")
+    parser.add_argument("--rl4co_scale", action="store_true", help="Use RL4CO CVRPTW scaled generator")
     ### ACO
     parser.add_argument("--aco", type=str, default="AS", choices=["AS", "ELITIST", "MAXMIN", "RANK"], help="ACO algorithm")
     ### LocalSearchParams
@@ -214,4 +297,11 @@ if __name__ == "__main__":
         local_search_params,
         args.vrptw,
         args.deepaco,
+        args.data_source,
+        args.data_dir,
+        args.rl4co_root,
+        args.rl4co_phase,
+        args.rl4co_file,
+        args.rl4co_seed,
+        args.rl4co_scale,
     )
