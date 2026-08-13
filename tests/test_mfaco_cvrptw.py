@@ -99,6 +99,26 @@ def test_cvrptw_local_search_preserves_tight_time_windows_across_seeds():
 
         assert_cvrptw_solution(coords, demand, windows, capacity, costs, routes)
 
+def test_cvrptw_fts_checks_match_scan_fallback_feasibility():
+    coords, demand, windows, capacity = gfacs_instance(32)
+
+    for use_fts_checks in (False, True):
+        solver = MFACO_CVRPTW(
+            coords,
+            demand,
+            windows,
+            capacity,
+            n_ants=8,
+            use_local_search=True,
+            cand_list_size=12,
+            use_fts_checks=use_fts_checks,
+        )
+        solver.seed_rng(17)
+
+        costs, routes, *_ = solver.sample()
+
+        assert_cvrptw_solution(coords, demand, windows, capacity, costs, routes)
+
 
 def test_cvrptw_segment_local_search_preserves_tight_capacity_and_windows():
     coords = np.array(

@@ -218,6 +218,7 @@ public:
   bool use_relocate;
   bool use_swap;
   bool use_2opt_star;
+  bool use_fts_checks;
 
   float capacity;
   int64_t capacity_int;
@@ -256,6 +257,8 @@ public:
   double time_ant = 0.0;
   double time_ls = 0.0;
   double time_split = 0.0;
+  mutable int64_t fts_checks = 0;
+  mutable int64_t fts_fallback_scans = 0;
 
   // RNG
   Xoshiro128Plus rng_;
@@ -325,6 +328,10 @@ private:
                                 const std::vector<int32_t> &next_node,
                                 const std::vector<int32_t> &node_route,
                                 const std::vector<int64_t> &route_loads) const;
+  bool linked_route_fts_feasible(
+      int32_t route_id, const std::vector<int32_t> &next_node,
+      const std::vector<int32_t> &node_route,
+      const std::vector<int64_t> &route_loads) const;
   bool can_append_tw(int32_t prev, int32_t node, float route_time) const;
   void enforce_time_windows(std::vector<int32_t> &route) const;
 
@@ -334,10 +341,10 @@ private:
   std::tuple<int32_t, bool, float>
   select_next_node(int32_t curr, int32_t curr_route, const float *probmat_row,
                    const std::vector<uint8_t> &visited,
-                   const std::vector<int32_t> &node_route,
-                   const std::vector<int64_t> &route_loads,
-                   const std::vector<int32_t> &next_node,
-                   const std::vector<int32_t> &prev_node, int32_t num_routes,
+                   std::vector<int32_t> &node_route,
+                   std::vector<int64_t> &route_loads,
+                   std::vector<int32_t> &next_node,
+                   std::vector<int32_t> &prev_node, int32_t num_routes,
                    int32_t max_routes, Xoshiro128Plus &rng,
                    int16_t &out_pick_j, uint64_t &out_valid_mask);
 

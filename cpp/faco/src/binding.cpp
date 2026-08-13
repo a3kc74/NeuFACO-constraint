@@ -329,6 +329,8 @@ public:
     d["time_ant"] = solver->time_ant;
     d["time_ls"] = solver->time_ls;
     d["time_split"] = solver->time_split;
+    d["fts_checks"] = solver->fts_checks;
+    d["fts_fallback_scans"] = solver->fts_fallback_scans;
     return d;
   }
 };
@@ -452,6 +454,10 @@ PYBIND11_MODULE(faco_opt, m) {
           "use_2opt_star",
           [](PyMFACO_CVRP &self) { return self.solver->use_2opt_star; },
           [](PyMFACO_CVRP &self, bool v) { self.solver->use_2opt_star = v; })
+      .def_property(
+          "use_fts_checks",
+          [](PyMFACO_CVRP &self) { return self.solver->use_fts_checks; },
+          [](PyMFACO_CVRP &self, bool v) { self.solver->use_fts_checks = v; })
       .def("reset_timings", &PyMFACO_CVRP::reset_timings)
       .def("get_timings", &PyMFACO_CVRP::get_timings);
 
@@ -507,6 +513,10 @@ PYBIND11_MODULE(faco_opt, m) {
           "use_2opt_star",
           [](PyMFACO_CVRPTW &self) { return self.solver->use_2opt_star; },
           [](PyMFACO_CVRPTW &self, bool v) { self.solver->use_2opt_star = v; })
+      .def_property(
+          "use_fts_checks",
+          [](PyMFACO_CVRPTW &self) { return self.solver->use_fts_checks; },
+          [](PyMFACO_CVRPTW &self, bool v) { self.solver->use_fts_checks = v; })
       .def("reset_timings", &PyMFACO_CVRPTW::reset_timings)
       .def("get_timings", &PyMFACO_CVRPTW::get_timings);
 

@@ -92,6 +92,7 @@ class MFACO_CVRP:
         fixed_steps: int = 0,
         nls: bool = False,
         T_nls: int = 10,
+        use_fts_checks: bool = True,
         **kwargs
     ):
         coords_np = _as_numpy_f32(coords)
@@ -124,6 +125,7 @@ class MFACO_CVRP:
         self._enable_torch_sync = enable_torch_sync
         self.alpha = alpha
         self.disable_heuristic = disable_heuristic
+        self._cpp.use_fts_checks = bool(use_fts_checks)
         
         if normalized_heuristic and not disable_heuristic:
             h = np.asarray(self._cpp.heuristic_sparse_np)
@@ -269,6 +271,7 @@ class MFACO_CVRPTW(MFACO_CVRP):
         fixed_steps: int = 0,
         nls: bool = False,
         T_nls: int = 10,
+        use_fts_checks: bool = True,
         **kwargs
     ):
         coords_np = _as_numpy_f32(coords)
@@ -307,6 +310,7 @@ class MFACO_CVRPTW(MFACO_CVRP):
         self._enable_torch_sync = enable_torch_sync
         self.alpha = alpha
         self.disable_heuristic = disable_heuristic
+        self._cpp.use_fts_checks = bool(use_fts_checks)
 
         if normalized_heuristic and not disable_heuristic:
             h = np.asarray(self._cpp.heuristic_sparse_np)

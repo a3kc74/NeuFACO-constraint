@@ -35,7 +35,7 @@ MFACO_CVRP::MFACO_CVRP(const float *coords_ptr, const float *demand_ptr,
       smooth_mmas(smooth_mmas_), capacity(capacity_),
       capacity_int(static_cast<int64_t>(std::round(capacity_ * DEMAND_SCALE))),
       nls(nls_), T_nls(T_nls_), use_relocate(true), use_swap(true),
-      use_2opt_star(true) {
+      use_2opt_star(true), use_fts_checks(true) {
   if (!coords_ptr || !demand_ptr) {
     throw std::runtime_error("coords_ptr and demand_ptr must not be null");
   }
@@ -243,6 +243,71 @@ bool MFACO_CVRP::linked_solution_feasible(
   return true;
 }
 
+bool MFACO_CVRP::linked_route_fts_feasible(
+    int32_t route_id, const std::vector<int32_t> &next_node,
+    const std::vector<int32_t> &node_route,
+    const std::vector<int64_t> &route_loads) const {
+  if (!use_fts_checks) {
+    fts_fallback_scans++;
+    return linked_route_feasible(route_id, next_node, node_route, route_loads);
+  }
+  fts_checks++;
+  if (route_id < 0 || route_id >= (int32_t)route_loads.size())
+    return false;
+  if (route_loads[route_id] > capacity_int)
+    return false;
+  if (!has_time_windows)
+    return true;
+
+  int32_t depot = n + route_id;
+  if (depot < 0 || depot >= (int32_t)next_node.size())
+    return false;
+
+  std::vector<int32_t> nodes;
+  std::vector<float> service_start;
+  std::vector<float> waiting;
+  nodes.reserve(n);
+  service_start.reserve(n);
+  waiting.reserve(n);
+  float route_time = 0.0f;
+  int32_t prev = 0;
+  int32_t w = next_node[depot];
+  int32_t guard = 0;
+  while (w < n) {
+    if (w <= 0 || w >= n || node_route[w] != route_id)
+      return false;
+    float arrival = route_time + dist(prev, w);
+    if (arrival > due_time[w] + 1e-6f)
+      return false;
+    float wait = std::max(ready_time[w] - arrival, 0.0f);
+    route_time = arrival + wait;
+    nodes.push_back(w);
+    service_start.push_back(route_time);
+    waiting.push_back(wait);
+    prev = w;
+    w = next_node[w];
+    if (++guard > n)
+      return false;
+  }
+  if (route_time + dist(prev, 0) > due_time[0] + 1e-6f)
+    return false;
+
+  float fts_next = due_time[0] - route_time - dist(prev, 0);
+  for (int32_t idx = (int32_t)nodes.size() - 1; idx >= 0; --idx) {
+    int32_t node = nodes[idx];
+    float downstream_slack =
+        (idx + 1 < (int32_t)nodes.size()) ? waiting[idx + 1] + fts_next
+                                          : fts_next;
+    float forward_slack =
+        std::min(due_time[node] - service_start[idx], downstream_slack);
+    if (forward_slack < -1e-6f)
+      return false;
+    fts_next = forward_slack;
+  }
+
+  return true;
+}
+
 void MFACO_CVRP::enforce_time_windows(std::vector<int32_t> &route) const {
   if (!has_time_windows || route.empty())
     return;
@@ -284,6 +349,8 @@ void MFACO_CVRP::reset_timings() {
   time_ant = 0.0;
   time_ls = 0.0;
   time_split = 0.0;
+  fts_checks = 0;
+  fts_fallback_scans = 0;
 }
 
 // -------------------- distance --------------------
@@ -663,6 +730,8 @@ void MFACO_CVRP::sample(bool require_prob, const float *prior_ptr,
     }
   };
 
+  auto ant_start_time = std::chrono::high_resolution_clock::now();
+
   if (require_prob) {
     ensure_ant_seeds();
     if (!parallel_traced) {
@@ -835,6 +904,8 @@ void MFACO_CVRP::sample(bool require_prob, const float *prior_ptr,
       }
     }
   }
+  auto ant_end_time = std::chrono::high_resolution_clock::now();
+  time_ant += std::chrono::duration<double>(ant_end_time - ant_start_time).count();
 }
 
 // -------------------- update pheromone: deposit on decoded VRP edges
@@ -1433,6 +1504,7 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
   // We'll resize route_loads after finding num_routes
   std::vector<int64_t> route_loads;
   std::vector<bool> dlb(n, false);
+  int32_t num_routes = 0;
 
   // Helpers
   auto dist = [&](int32_t u, int32_t v) {
@@ -1477,6 +1549,104 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
            linked_route_feasible(r_b, next_node, node_route, route_loads);
   };
 
+  struct RouteFTSState {
+    std::vector<float> service_start;
+    std::vector<float> forward_slack;
+    std::vector<uint8_t> valid;
+  };
+
+  auto build_route_fts_state = [&]() {
+    RouteFTSState state;
+    state.service_start.assign(n + num_routes, 0.0f);
+    state.forward_slack.assign(n + num_routes, 0.0f);
+    state.valid.assign(num_routes, 0);
+    if (!has_time_windows || !use_fts_checks)
+      return state;
+
+    for (int32_t r = 0; r < num_routes; ++r) {
+      std::vector<int32_t> nodes;
+      std::vector<float> waiting;
+      nodes.reserve(n);
+      waiting.reserve(n);
+
+      float route_time = 0.0f;
+      int32_t prev = 0;
+      int32_t w = next_node[n + r];
+      bool ok = route_loads[r] <= capacity_int;
+      int32_t guard = 0;
+      while (ok && w < n) {
+        if (w <= 0 || w >= n || node_route[w] != r) {
+          ok = false;
+          break;
+        }
+        float arrival = route_time + dist(prev, w);
+        if (arrival > due_time[w] + 1e-6f) {
+          ok = false;
+          break;
+        }
+        float wait = std::max(ready_time[w] - arrival, 0.0f);
+        route_time = arrival + wait;
+        state.service_start[w] = route_time;
+        nodes.push_back(w);
+        waiting.push_back(wait);
+        prev = w;
+        w = next_node[w];
+        if (++guard > n) {
+          ok = false;
+          break;
+        }
+      }
+      if (!ok || route_time + dist(prev, 0) > due_time[0] + 1e-6f)
+        continue;
+
+      float fts_next = due_time[0] - route_time - dist(prev, 0);
+      for (int32_t idx = (int32_t)nodes.size() - 1; idx >= 0; --idx) {
+        int32_t node = nodes[idx];
+        float downstream_slack =
+            (idx + 1 < (int32_t)nodes.size()) ? waiting[idx + 1] + fts_next
+                                              : fts_next;
+        float fts = std::min(due_time[node] - state.service_start[node],
+                             downstream_slack);
+        if (fts < -1e-6f) {
+          ok = false;
+          break;
+        }
+        state.forward_slack[node] = fts;
+        fts_next = fts;
+      }
+      if (ok)
+        state.valid[r] = 1;
+    }
+    return state;
+  };
+
+  auto fts_insert_customer_feasible = [&](const RouteFTSState &state,
+                                          int32_t route_id,
+                                          int32_t pred, int32_t node,
+                                          int32_t succ) {
+    if (!has_time_windows || !use_fts_checks)
+      return false;
+    if (route_id < 0 || route_id >= (int32_t)state.valid.size() ||
+        !state.valid[route_id])
+      return false;
+    float pred_start = (pred >= n || pred == 0) ? 0.0f : state.service_start[pred];
+    float node_arrival = pred_start + dist(pred, node);
+    if (node_arrival > due_time[node] + 1e-6f)
+      return false;
+    float node_start = std::max(node_arrival, ready_time[node]);
+    if (succ >= n) {
+      return node_start + dist(node, 0) <= due_time[0] + 1e-6f;
+    }
+    float old_succ_arrival = pred_start + dist(pred, succ);
+    float old_succ_start = state.service_start[succ];
+    float new_succ_arrival = node_start + dist(node, succ);
+    if (new_succ_arrival > due_time[succ] + 1e-6f)
+      return false;
+    float new_succ_start = std::max(new_succ_arrival, ready_time[succ]);
+    float delay = new_succ_start - old_succ_start;
+    return delay <= state.forward_slack[succ] + 1e-6f;
+  };
+
   // Focused LS: only process nodes in checklist (no fallback to all nodes)
   if (checklist.empty()) {
     return 0.0f; // Nothing to do
@@ -1485,7 +1655,7 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
   // Get current routes
   auto routes =
       initial_routes_from_perm(perm); // Uses "perm" which is now full route
-  int32_t num_routes = (int32_t)routes.size();
+  num_routes = (int32_t)routes.size();
 
   if (num_routes > n) {
     // Just in case, though guaranteed by split logic usually
@@ -1525,6 +1695,7 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
   }
 
   const float EPS = 1e-5f; // Tighten EPS
+  RouteFTSState fts_state = build_route_fts_state();
 
   // 2. Main Loop
   int32_t head = 0;
@@ -1596,6 +1767,7 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
             touch(prev_u);
             touch(next_u);
             touch(old_next_v);
+            fts_state = build_route_fts_state();
             improved = true;
             total_improvement -= delta; // delta is negative
             break;
@@ -1644,6 +1816,7 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
             touch(v);
             touch(prev_u);
             touch(next_u);
+            fts_state = build_route_fts_state();
             improved = true;
             total_improvement -= delta2;
             break;
@@ -1952,10 +2125,12 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
       }
 
     }
-    if (improved)
+    if (improved) {
+      fts_state = build_route_fts_state();
       head = 0;
-    else
+    } else {
       dlb[u] = true;
+    }
   }
 
   // 3. Reconstruct depot-separated route (not permutation)
@@ -2337,10 +2512,10 @@ float MFACO_CVRP::sample_ant_direct(const float *probmat, int32_t start_node,
 
 std::tuple<int32_t, bool, float> MFACO_CVRP::select_next_node(
     int32_t curr, int32_t curr_route, const float *probmat_row,
-    const std::vector<uint8_t> &visited, const std::vector<int32_t> &node_route,
-    const std::vector<int64_t> &route_loads,
-    const std::vector<int32_t> &next_node,
-    const std::vector<int32_t> &prev_node, int32_t num_routes,
+    const std::vector<uint8_t> &visited, std::vector<int32_t> &node_route,
+    std::vector<int64_t> &route_loads,
+    std::vector<int32_t> &next_node,
+    std::vector<int32_t> &prev_node, int32_t num_routes,
     int32_t max_routes, Xoshiro128Plus &rng, int16_t &out_pick_j,
     uint64_t &out_valid_mask) {
   int32_t c_size = 0;
@@ -2364,6 +2539,132 @@ std::tuple<int32_t, bool, float> MFACO_CVRP::select_next_node(
     return linked_solution_feasible(routes, nn, nr, rl);
   };
 
+  struct SelectFTSState {
+    std::vector<float> service_start;
+    std::vector<float> forward_slack;
+    std::vector<uint8_t> valid;
+  };
+
+  auto build_select_fts_state = [&]() {
+    SelectFTSState state;
+    state.service_start.assign(next_node.size(), 0.0f);
+    state.forward_slack.assign(next_node.size(), 0.0f);
+    state.valid.assign(num_routes, 0);
+    if (!has_time_windows || !use_fts_checks)
+      return state;
+
+    for (int32_t r = 0; r < num_routes; ++r) {
+      if (route_loads[r] > capacity_int)
+        continue;
+      std::vector<int32_t> nodes;
+      std::vector<float> waiting;
+      nodes.reserve(n);
+      waiting.reserve(n);
+
+      float route_time = 0.0f;
+      int32_t prev = 0;
+      int32_t w = next_node[n + r];
+      bool ok = true;
+      int32_t guard = 0;
+      while (ok && w < n) {
+        if (w <= 0 || w >= n || node_route[w] != r) {
+          ok = false;
+          break;
+        }
+        float arrival = route_time + dist(prev, w);
+        if (arrival > due_time[w] + 1e-6f) {
+          ok = false;
+          break;
+        }
+        float wait = std::max(ready_time[w] - arrival, 0.0f);
+        route_time = arrival + wait;
+        state.service_start[w] = route_time;
+        nodes.push_back(w);
+        waiting.push_back(wait);
+        prev = w;
+        w = next_node[w];
+        if (++guard > n) {
+          ok = false;
+          break;
+        }
+      }
+      if (!ok || route_time + dist(prev, 0) > due_time[0] + 1e-6f)
+        continue;
+
+      float fts_next = due_time[0] - route_time - dist(prev, 0);
+      for (int32_t idx = (int32_t)nodes.size() - 1; idx >= 0; --idx) {
+        int32_t node = nodes[idx];
+        float downstream_slack =
+            (idx + 1 < (int32_t)nodes.size()) ? waiting[idx + 1] + fts_next
+                                              : fts_next;
+        float fts = std::min(due_time[node] - state.service_start[node],
+                             downstream_slack);
+        if (fts < -1e-6f) {
+          ok = false;
+          break;
+        }
+        state.forward_slack[node] = fts;
+        fts_next = fts;
+      }
+      if (ok)
+        state.valid[r] = 1;
+    }
+    return state;
+  };
+
+  SelectFTSState select_fts_state = build_select_fts_state();
+
+  auto select_fts_insert_feasible = [&](int32_t route_id, int32_t pred,
+                                        int32_t node, int32_t succ) {
+    if (!has_time_windows || !use_fts_checks)
+      return false;
+    if (route_id < 0 || route_id >= (int32_t)select_fts_state.valid.size() ||
+        !select_fts_state.valid[route_id])
+      return false;
+    fts_checks++;
+    float pred_start = (pred >= n || pred == 0)
+                           ? 0.0f
+                           : select_fts_state.service_start[pred];
+    float node_arrival = pred_start + dist(pred >= n ? 0 : pred, node);
+    if (node_arrival > due_time[node] + 1e-6f)
+      return false;
+    float node_start = std::max(node_arrival, ready_time[node]);
+    if (succ >= n)
+      return node_start + dist(node, 0) <= due_time[0] + 1e-6f;
+    float old_succ_start = select_fts_state.service_start[succ];
+    float new_succ_arrival = node_start + dist(node, succ);
+    if (new_succ_arrival > due_time[succ] + 1e-6f)
+      return false;
+    float new_succ_start = std::max(new_succ_arrival, ready_time[succ]);
+    float delay = new_succ_start - old_succ_start;
+    return delay <= select_fts_state.forward_slack[succ] + 1e-6f;
+  };
+
+  auto select_fts_remove_feasible = [&](int32_t route_id, int32_t pred,
+                                        int32_t removed, int32_t succ) {
+    if (!has_time_windows || !use_fts_checks)
+      return false;
+    if (route_id < 0 || route_id >= (int32_t)select_fts_state.valid.size() ||
+        !select_fts_state.valid[route_id])
+      return false;
+    fts_checks++;
+    if (succ >= n) {
+      float pred_start = (pred >= n || pred == 0)
+                             ? 0.0f
+                             : select_fts_state.service_start[pred];
+      return pred_start + dist(pred >= n ? 0 : pred, 0) <= due_time[0] + 1e-6f;
+    }
+    float pred_start = (pred >= n || pred == 0)
+                           ? 0.0f
+                           : select_fts_state.service_start[pred];
+    float new_succ_arrival = pred_start + dist(pred >= n ? 0 : pred, succ);
+    if (new_succ_arrival > due_time[succ] + 1e-6f)
+      return false;
+    float new_succ_start = std::max(new_succ_arrival, ready_time[succ]);
+    float delay = new_succ_start - select_fts_state.service_start[succ];
+    return delay <= select_fts_state.forward_slack[succ] + 1e-6f;
+  };
+
   auto can_take_customer = [&](int32_t v) -> bool {
     if (v <= 0 || v >= n || visited[v])
       return false;
@@ -2374,6 +2675,52 @@ std::tuple<int32_t, bool, float> MFACO_CVRP::select_next_node(
       return false;
     if (!has_time_windows)
       return true;
+
+    int32_t prev_v0 = prev_node[v];
+    int32_t next_v0 = next_node[v];
+    if (curr_route != v_route &&
+        select_fts_insert_feasible(curr_route, curr, v, next_node[curr]) &&
+        select_fts_remove_feasible(v_route, prev_v0, v, next_v0))
+      return true;
+
+    fts_fallback_scans++;
+    if (use_fts_checks) {
+      int32_t prev_v = prev_node[v];
+      int32_t next_v = next_node[v];
+      if (prev_v == curr)
+        return linked_route_feasible(curr_route, next_node, node_route, route_loads);
+
+      int32_t next_c = next_node[curr];
+      int64_t old_load_v = route_loads[v_route];
+      int64_t old_load_curr = route_loads[curr_route];
+      int32_t old_route_v = node_route[v];
+
+      next_node[prev_v] = next_v;
+      prev_node[next_v] = prev_v;
+      next_node[curr] = v;
+      prev_node[v] = curr;
+      next_node[v] = next_c;
+      prev_node[next_c] = v;
+
+      if (curr_route != v_route) {
+        route_loads[v_route] -= demand_int[v];
+        route_loads[curr_route] += demand_int[v];
+        node_route[v] = curr_route;
+      }
+
+      bool ok = route_state_feasible(next_node, node_route, route_loads, num_routes);
+
+      next_node[prev_v] = v;
+      prev_node[v] = prev_v;
+      next_node[v] = next_v;
+      prev_node[next_v] = v;
+      next_node[curr] = next_c;
+      prev_node[next_c] = curr;
+      route_loads[v_route] = old_load_v;
+      route_loads[curr_route] = old_load_curr;
+      node_route[v] = old_route_v;
+      return ok;
+    }
 
     std::vector<int32_t> nn = next_node;
     std::vector<int32_t> pp = prev_node;
