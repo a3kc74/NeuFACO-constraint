@@ -240,7 +240,7 @@ def build_ppo_instance_for_prior(demands, positions, windows):
     return {
         "coords": positions,
         "demand": demands,
-        "windows": windows,args
+        "windows": windows,
         "capacity": 1.0,
     }
 
@@ -302,7 +302,7 @@ def infer_instance(
     windows,
     n_ants: int,
     n_iter: int,
-    mini_H: int,
+    log_period: int,
     threads: int | None,
     seed: int,
     cand_list_size: int,
@@ -322,6 +322,7 @@ def infer_instance(
     elite_min_diversity: float = 0.15,
     elite_cost_tolerance: float = 1.05,
     source_count: int = 2,
+    elite_source_period: int = 1,
     pin_global_best_elite: bool = False,
     gfacs_model=None,
     gfacs_k_sparse: int | None = None,
@@ -337,8 +338,12 @@ def infer_instance(
     distances=None,
     cost_evaluator=None,
 ):
-    if mini_H < 1:
-        raise ValueError("mini_H must be >= 1")
+    if elite_source_period < 0:
+        raise ValueError("elite_source_period must be >= 0")
+    if log_period < 1:
+        raise ValueError("log_period must be >= 1")
+    if source_count < 1:
+        raise ValueError("source_count must be >= 1")
     if threads is not None and threads < 1:
         raise ValueError("threads must be >= 1")
 
@@ -365,8 +370,13 @@ def infer_instance(
     )
     solver.seed_rng(seed)
 
-    results = torch.zeros(size=(n_iter,), dtype=torch.float32)
-    diversities = torch.zeros(size=(n_iter,), dtype=torch.float32)
+    log_steps = list(range(log_period, n_iter + 1, log_period))
+    if not log_steps or log_steps[-1] != n_iter:
+        log_steps.append(n_iter)
+    log_step_set = set(log_steps)
+    results = torch.zeros(size=(len(log_steps),), dtype=torch.float32)
+    diversities = torch.zeros(size=(len(log_steps),), dtype=torch.float32)
+    log_idx = 0
     best_so_far = float("inf")
     global_best_route = None
     elite_archive = []
@@ -403,62 +413,74 @@ def infer_instance(
         return static_prior
 
     start = time.time()
+    log_group_idx = 0
+    iter_prior = current_prior() if ppo_model is not None and ppo_prior_refresh == "outer" else static_prior
     for t in range(n_iter):
-        iter_prior = current_prior() if ppo_model is not None and ppo_prior_refresh == "outer" else static_prior
+        is_log_step = (t + 1) in log_step_set
+        is_group_start = t % log_period == 0
+        if is_group_start:
+            iter_prior = current_prior() if ppo_model is not None and ppo_prior_refresh == "outer" else static_prior
         iter_prior_fn = current_prior if ppo_model is not None and ppo_prior_refresh == "sample" else None
-        routes = None
-        for _mini_t in range(mini_H):
-            if _mini_t == mini_H - 1 and len(elite_archive) > 1:
-                costs_np, routes = sample_multisource(
-                    solver,
-                    elite_archive,
-                    source_count,
-                    prior_fn=iter_prior_fn,
-                    prior=iter_prior,
-                )
-            else:
-                elite_source = select_elite_source(elite_archive, t) if _mini_t == mini_H - 1 else None
+
+        if is_log_step and elite_source_period > 0 and (t + 1) % elite_source_period == 0 and len(elite_archive) > 1:
+            costs_np, routes = sample_multisource(
+                solver,
+                elite_archive,
+                source_count,
+                prior_fn=iter_prior_fn,
+                prior=iter_prior,
+            )
+        else:
+            if is_log_step and elite_source_period > 0 and (t + 1) % elite_source_period == 0:
+                elite_source = select_elite_source(elite_archive, log_group_idx)
                 if elite_source is not None:
                     solver.set_source_route(elite_source["route"], elite_source["cost"])
-                elif _mini_t == mini_H - 1 and global_best_route is not None:
+                elif global_best_route is not None:
                     solver.set_source_route(global_best_route, best_so_far)
-                costs, routes, *_ = solver.sample(prior=resolve_prior(iter_prior, iter_prior_fn))
-                costs_np = np.asarray(costs, dtype=np.float32)
-            best_idx = int(np.argmin(costs_np))
-            best_cost = float(costs_np[best_idx])
-            best_route = np.asarray(routes[best_idx], dtype=np.int32)
-            if best_cost < best_so_far:
-                best_so_far = best_cost
-                global_best_route = best_route.copy()
-            pinned_elite = {"route": global_best_route, "cost": best_so_far} if pin_global_best_elite and global_best_route is not None else None
-            elite_archive = update_elite_archive(
-                elite_archive,
-                routes,
-                costs_np,
-                elite_k=elite_k,
-                elite_min_diversity=elite_min_diversity,
-                elite_cost_tolerance=elite_cost_tolerance,
-                pinned_elite=pinned_elite,
-            )
-        
-            solver.update_pheromone(best_route, best_cost)
-        if cost_evaluator is not None and global_best_route is not None:
-            results[t] = float(cost_evaluator([global_best_route])[0])
-        else:
-            results[t] = best_so_far
-        diversities[t] = route_diversity(routes)
+            costs, routes, *_ = solver.sample(prior=resolve_prior(iter_prior, iter_prior_fn))
+            costs_np = np.asarray(costs, dtype=np.float32)
+
+        best_idx = int(np.argmin(costs_np))
+        best_cost = float(costs_np[best_idx])
+        best_route = np.asarray(routes[best_idx], dtype=np.int32)
+        if best_cost < best_so_far:
+            best_so_far = best_cost
+            global_best_route = best_route.copy()
+        pinned_elite = {"route": global_best_route, "cost": best_so_far} if pin_global_best_elite and global_best_route is not None else None
+        elite_archive = update_elite_archive(
+            elite_archive,
+            routes,
+            costs_np,
+            elite_k=elite_k,
+            elite_min_diversity=elite_min_diversity,
+            elite_cost_tolerance=elite_cost_tolerance,
+            pinned_elite=pinned_elite,
+        )
+
+        solver.update_pheromone(best_route, best_cost)
+        if is_log_step:
+            if cost_evaluator is not None and global_best_route is not None:
+                results[log_idx] = float(cost_evaluator([global_best_route])[0])
+            else:
+                results[log_idx] = best_so_far
+            diversities[log_idx] = route_diversity(routes)
+            log_idx += 1
+            log_group_idx += 1
     elapsed = time.time() - start
-    return results, diversities, elapsed
+    return results, diversities, elapsed, log_steps
 
 
-def test(dataset, n_ants: int, n_iter: int, mini_H: int, threads: int | None, seed: int, **solver_kwargs):
-    sum_results = torch.zeros(size=(n_iter,), dtype=torch.float32)
-    sum_diversities = torch.zeros(size=(n_iter,), dtype=torch.float32)
+def test(dataset, n_ants: int, n_iter: int, log_period: int, threads: int | None, seed: int, **solver_kwargs):
+    log_steps = list(range(log_period, n_iter + 1, log_period))
+    if not log_steps or log_steps[-1] != n_iter:
+        log_steps.append(n_iter)
+    sum_results = torch.zeros(size=(len(log_steps),), dtype=torch.float32)
+    sum_diversities = torch.zeros(size=(len(log_steps),), dtype=torch.float32)
     sum_times = 0.0
 
     for idx, item in enumerate(tqdm(dataset, dynamic_ncols=True)):
         demands, distances, positions, windows, cost_evaluator = normalize_dataset_item(item)
-        results, diversities, elapsed_time = infer_instance(
+        results, diversities, elapsed_time, instance_log_steps = infer_instance(
             demands=demands.cpu(),
             distances=distances.cpu(),
             positions=positions.cpu(),
@@ -466,7 +488,7 @@ def test(dataset, n_ants: int, n_iter: int, mini_H: int, threads: int | None, se
             cost_evaluator=cost_evaluator,
             n_ants=n_ants,
             n_iter=n_iter,
-            mini_H=mini_H,
+            log_period=log_period,
             threads=threads,
             seed=seed + idx,
             **solver_kwargs,
@@ -475,7 +497,8 @@ def test(dataset, n_ants: int, n_iter: int, mini_H: int, threads: int | None, se
         sum_diversities += diversities
         sum_times += elapsed_time
 
-    return sum_results / len(dataset), sum_diversities / len(dataset), sum_times / len(dataset)
+    assert instance_log_steps == log_steps
+    return sum_results / len(dataset), sum_diversities / len(dataset), sum_times / len(dataset), log_steps
 
 
 def write_results(
@@ -486,12 +509,14 @@ def write_results(
     n_instances: int,
     n_ants: int,
     n_iter: int,
-    mini_H: int,
+    log_period: int,
+    elite_source_period: int,
     threads: int | None,
     seed: int,
     duration: float,
     avg_cost,
     avg_diversity,
+    log_steps: list[int],
     data_source: str = "gfacs",
     rl4co_phase: str = "test",
     rl4co_file: str | Path | None = None,
@@ -531,17 +556,18 @@ def write_results(
         f.write(f"ppo_prior_scale: {ppo_prior_scale}\n")
         f.write(f"ppo_prior_center: {ppo_prior_center}\n")
         f.write(f"n_ants: {n_ants}\n")
-        f.write(f"mini_H: {mini_H}\n")
+        f.write(f"log_period: {log_period}\n")
+        f.write(f"elite_source_period: {elite_source_period}\n")
         f.write(f"threads: {threads if threads is not None else 'default'}\n")
         f.write(f"seed: {seed}\n")
         f.write(f"average inference time: {duration}\n")
-        for i in range(n_iter):
+        for i, _step in enumerate(log_steps):
             f.write(f"T={i + 1}, avg. cost {avg_cost[i]}, avg. diversity {avg_diversity[i]}\n")
 
     with result_csv.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["T", "avg_cost", "avg_diversity"])
         writer.writeheader()
-        for i in range(n_iter):
+        for i, _step in enumerate(log_steps):
             writer.writerow({"T": i + 1, "avg_cost": float(avg_cost[i]), "avg_diversity": float(avg_diversity[i])})
 
 
@@ -551,7 +577,8 @@ def main(
     size: int | None = None,
     n_ants: int = 100,
     n_iter: int = 10,
-    mini_H: int = 1,
+    log_period: int = 1,
+    elite_source_period: int = 1,
     threads: int | None = None,
     seed: int = 0,
     tam: bool = False,
@@ -594,8 +621,12 @@ def main(
     ppo_prior_scale: float = 1.0,
     ppo_prior_center: bool = False,
 ):
-    if mini_H < 1:
-        raise ValueError("mini_H must be >= 1")
+    if elite_source_period < 0:
+        raise ValueError("elite_source_period must be >= 0")
+    if log_period < 1:
+        raise ValueError("log_period must be >= 1")
+    if source_count < 1:
+        raise ValueError("source_count must be >= 1")
     if threads is not None and threads < 1:
         raise ValueError("threads must be >= 1")
     if threads is not None:
@@ -661,15 +692,16 @@ def main(
     print("ppo_prior_scale:", ppo_prior_scale)
     print("ppo_prior_center:", ppo_prior_center)
     print("n_ants:", n_ants)
-    print("mini_H:", mini_H)
+    print("log_period:", log_period)
+    print("elite_source_period:", elite_source_period)
     print("threads:", threads if threads is not None else "default")
     print("seed:", seed)
 
-    avg_cost, avg_diversity, duration = test(
+    avg_cost, avg_diversity, duration, log_steps = test(
         dataset,
         n_ants=n_ants,
         n_iter=n_iter,
-        mini_H=mini_H,
+        log_period=log_period,
         threads=threads,
         seed=seed,
         cand_list_size=cand_list_size,
@@ -689,6 +721,7 @@ def main(
         elite_min_diversity=elite_min_diversity,
         elite_cost_tolerance=elite_cost_tolerance,
         source_count=source_count,
+        elite_source_period=elite_source_period,
         pin_global_best_elite=pin_global_best_elite,
         gfacs_model=gfacs_model,
         gfacs_k_sparse=k_sparse,
@@ -704,13 +737,13 @@ def main(
     )
 
     print("average inference time: ", duration)
-    for i in range(n_iter):
+    for i, _step in enumerate(log_steps):
         print(f"T={i + 1}, avg. cost {avg_cost[i]}, avg. diversity {avg_diversity[i]}")
 
     out_dir = Path(output_dir) if output_dir is not None else ROOT_DIR / "pretrained" / "cvrptw" / str(n_nodes) / "faco"
     result_filename = (
         f"test_result_ckpt{checkpoint_type}-{data_source}-{problem_name}{n_nodes}-ninst{size}-"
-        f"nants{n_ants}-niter{n_iter}-miniH{mini_H}-threads{threads if threads is not None else 'default'}-seed{seed}-faco"
+        f"nants{n_ants}-niter{n_iter}-logperiod{log_period}-eliteperiod{elite_source_period}-threads{threads if threads is not None else 'default'}-seed{seed}-faco"
     )
     result_txt = out_dir / f"{result_filename}.txt"
     result_csv = out_dir / f"{result_filename}.csv"
@@ -722,12 +755,14 @@ def main(
         n_instances=len(dataset),
         n_ants=n_ants,
         n_iter=n_iter,
-        mini_H=mini_H,
+        log_period=log_period,
+        elite_source_period=elite_source_period,
         threads=threads,
         seed=seed,
         duration=duration,
         avg_cost=avg_cost,
         avg_diversity=avg_diversity,
+        log_steps=log_steps,
         data_source=data_source,
         rl4co_phase=rl4co_phase,
         rl4co_file=rl4co_file,
@@ -752,7 +787,6 @@ def parse_args():
     parser.add_argument("nodes", type=int, help="Problem scale")
     parser.add_argument("-k", "--k_sparse", type=int, default=None, help="k_sparse / default FACO candidate list size")
     parser.add_argument("-i", "--n_iter", type=int, default=10, help="Number of FACO iterations")
-    parser.add_argument("--mini_H", type=int, default=1, help="Number of FACO mini-iterations per outer iteration")
     parser.add_argument("--threads", type=int, default=None, help="OpenMP thread count for parallel C++ FACO sampling/update")
     parser.add_argument("-n", "--n_ants", type=int, default=100, help="Number of ants")
     parser.add_argument("-s", "--size", type=int, default=None, help="Number of instances to test")
@@ -784,7 +818,9 @@ def parse_args():
     parser.add_argument("--elite_k", type=int, default=8, help="Number of quality-diverse elite source routes")
     parser.add_argument("--elite_min_diversity", type=float, default=0.15, help="Minimum edge distance between elite source routes")
     parser.add_argument("--elite_cost_tolerance", type=float, default=1.05, help="Maximum elite source cost ratio versus current best")
-    parser.add_argument("--source_count", type=int, default=2, help="Number of elite source routes used by final-mini multisource sampling")
+    parser.add_argument("--source_count", type=int, default=2, help="Number of elite routes retained for periodic source selection")
+    parser.add_argument("--elite_source_period", type=int, default=1, help="Use an elite source every N iterations; 0 disables periodic elite source")
+    parser.add_argument("--log_period", type=int, default=1, help="Record cost/diversity every N iterations")
     parser.add_argument("--pin_global_best_elite", action="store_true", help="Always keep global best as one elite archive route")
     parser.add_argument("--gfacs_pretrained", type=Path, default=None, help="Path to GFACS checkpoint used to generate sampling prior")
     parser.add_argument("--gfacs_device", type=str, default=None, help="Device for GFACS prior computation; defaults to cuda:0 if available else cpu")
@@ -808,7 +844,7 @@ if __name__ == "__main__":
         size=args.size,
         n_ants=args.n_ants,
         n_iter=args.n_iter,
-        mini_H=args.mini_H,
+        log_period=args.log_period,
         threads=args.threads,
         seed=args.seed,
         tam=args.tam,
@@ -838,6 +874,7 @@ if __name__ == "__main__":
         elite_min_diversity=args.elite_min_diversity,
         elite_cost_tolerance=args.elite_cost_tolerance,
         source_count=args.source_count,
+        elite_source_period=args.elite_source_period,
         pin_global_best_elite=args.pin_global_best_elite,
         gfacs_pretrained=args.gfacs_pretrained,
         gfacs_device=args.gfacs_device,
