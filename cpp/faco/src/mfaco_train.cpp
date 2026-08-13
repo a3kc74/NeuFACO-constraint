@@ -102,6 +102,8 @@ void MFACO_CVRP::set_time_windows(const float *windows_ptr) {
     due_time[i] = windows_ptr[i * 2 + 1];
   }
 
+  build_nn_lists();
+  build_heuristic();
   build_initial_solution();
   auto [tmin, tmax] = smooth_mmas ? calc_trail_limits_smooth(source_cost)
                                   : calc_trail_limits_cl(source_cost);
@@ -363,13 +365,88 @@ float MFACO_CVRP::dist(int32_t u, int32_t v) const {
 }
 
 // -------------------- NN lists (same as TSP) --------------------
+float MFACO_CVRP::granular_proximity(int32_t u, int32_t v, float d_scale,
+                                      float t_scale) const {
+  float distance = dist(u, v);
+  if (!has_time_windows || granular_mode == 0) {
+    return distance;
+  }
+  float departure = (u >= 0 && u < n) ? ready_time[u] : 0.0f;
+  float arrival = departure + distance;
+  float wait = std::max(ready_time[v] - arrival, 0.0f);
+  float warp = std::max(arrival - due_time[v], 0.0f);
+  return distance / std::max(d_scale, 1e-6f) +
+         granular_wait_weight * wait / std::max(t_scale, 1e-6f) +
+         granular_time_warp_weight * warp / std::max(t_scale, 1e-6f);
+}
+
 void MFACO_CVRP::build_nn_lists() {
-  nn_list.resize(n * k);
-  backup_list.resize(n * bl);
+  nn_list.assign(n * k, 0);
+  backup_list.assign(n * bl, 0);
 
   const int32_t total = k + bl;
   if (total <= 0)
     return;
+
+  if (has_time_windows && granular_mode > 0) {
+    float d_sum = 0.0f;
+    int32_t d_count = 0;
+    for (int32_t u = 0; u < n; ++u) {
+      for (int32_t v = 0; v < n; ++v) {
+        if (u == v)
+          continue;
+        d_sum += dist(u, v);
+        d_count++;
+      }
+    }
+    float d_scale = d_count > 0 ? d_sum / (float)d_count : 1.0f;
+    float min_ready = ready_time.empty() ? 0.0f : ready_time[0];
+    float max_due = due_time.empty() ? 1.0f : due_time[0];
+    for (int32_t i = 0; i < n; ++i) {
+      min_ready = std::min(min_ready, ready_time[i]);
+      max_due = std::max(max_due, due_time[i]);
+    }
+    float t_scale = std::max(max_due - min_ready, 1.0f);
+
+#pragma omp parallel for schedule(static)
+    for (int32_t u = 0; u < n; ++u) {
+      std::vector<std::pair<float, int32_t>> scored;
+      scored.reserve(std::max(0, n - 1));
+      for (int32_t v = 0; v < n; ++v) {
+        if (v == u)
+          continue;
+        if (u > 0 && v == 0)
+          continue;
+        scored.emplace_back(granular_proximity(u, v, d_scale, t_scale), v);
+      }
+      std::sort(scored.begin(), scored.end(),
+                [](const auto &a, const auto &b) {
+                  if (a.first != b.first)
+                    return a.first < b.first;
+                  return a.second < b.second;
+                });
+
+      int32_t current_k = 0;
+      int32_t current_bl = 0;
+      if (u > 0 && k > 0) {
+        nn_list[u * k] = 0;
+        current_k = 1;
+      }
+      for (const auto &item : scored) {
+        int32_t v = item.second;
+        if (current_k < k) {
+          nn_list[u * k + current_k] = v;
+          current_k++;
+        } else if (current_bl < bl) {
+          backup_list[u * bl + current_bl] = v;
+          current_bl++;
+        } else {
+          break;
+        }
+      }
+    }
+    return;
+  }
 
   std::vector<Vec2d> pts(static_cast<size_t>(n));
   for (int32_t i = 0; i < n; ++i) {
@@ -392,14 +469,11 @@ void MFACO_CVRP::build_nn_lists() {
       int32_t current_k = 0;
       int32_t current_bl = 0;
 
-      // Force depot as first neighbor for customers
       if (u > 0 && k > 0) {
         nn_list[u * k + 0] = 0;
         current_k = 1;
       }
 
-      // Search KDTree
-      // We search a bit more than total to account for self/depot skips
       int32_t search_limit = total + 5;
 
       for (int32_t step = 0; step < search_limit; ++step) {
@@ -413,9 +487,9 @@ void MFACO_CVRP::build_nn_lists() {
         deleted_nodes.push_back(v);
 
         if (v == u)
-          continue; // Skip self
+          continue;
         if (u > 0 && v == 0)
-          continue; // Skip depot for customers (already added)
+          continue;
 
         if (current_k < k) {
           nn_list[u * k + current_k] = v;
@@ -426,7 +500,6 @@ void MFACO_CVRP::build_nn_lists() {
         }
       }
 
-      // Undelete all deleted nodes
       for (int32_t v_del : deleted_nodes) {
         kdtree.undelete_point(static_cast<uint32_t>(v_del));
       }
@@ -448,7 +521,6 @@ void MFACO_CVRP::build_heuristic() {
       float d = dist(u, v);
       float d0 = dist(u, 0);
       float d1 = dist(0, v);
-      // Savings heuristic
       d = d0 + d1 - d;
       heuristic_sparse[u * k + j] = d;
     }

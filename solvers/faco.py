@@ -93,6 +93,9 @@ class MFACO_CVRP:
         nls: bool = False,
         T_nls: int = 10,
         use_fts_checks: bool = True,
+        granular_mode: int = 0,
+        granular_wait_weight: float = 0.2,
+        granular_time_warp_weight: float = 1.0,
         **kwargs
     ):
         coords_np = _as_numpy_f32(coords)
@@ -272,6 +275,9 @@ class MFACO_CVRPTW(MFACO_CVRP):
         nls: bool = False,
         T_nls: int = 10,
         use_fts_checks: bool = True,
+        granular_mode: int = 0,
+        granular_wait_weight: float = 0.2,
+        granular_time_warp_weight: float = 1.0,
         **kwargs
     ):
         coords_np = _as_numpy_f32(coords)
@@ -305,6 +311,9 @@ class MFACO_CVRPTW(MFACO_CVRP):
             int(fixed_steps),
             bool(nls),
             int(T_nls),
+            int(granular_mode),
+            float(granular_wait_weight),
+            float(granular_time_warp_weight),
         )
         self.device = device
         self._enable_torch_sync = enable_torch_sync

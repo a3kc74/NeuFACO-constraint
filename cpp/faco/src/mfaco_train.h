@@ -219,6 +219,9 @@ public:
   bool use_swap;
   bool use_2opt_star;
   bool use_fts_checks;
+  int32_t granular_mode = 0; // 0 euclidean, 1 static spatio-temporal
+  float granular_wait_weight = 0.2f;
+  float granular_time_warp_weight = 1.0f;
 
   float capacity;
   int64_t capacity_int;
@@ -312,6 +315,7 @@ public:
 private:
   // ---- build helpers ----
   void build_nn_lists();
+  float granular_proximity(int32_t u, int32_t v, float d_scale, float t_scale) const;
   // void build_nn_pos();
   void build_heuristic();
   void build_d0();

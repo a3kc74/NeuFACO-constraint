@@ -302,7 +302,6 @@ def infer_instance(
     windows,
     n_ants: int,
     n_iter: int,
-    log_period: int,
     threads: int | None,
     seed: int,
     cand_list_size: int,
@@ -318,6 +317,11 @@ def infer_instance(
     fixed_steps: int,
     nls: bool,
     T_nls: int,
+    log_period: int = 1,
+    mini_H: int = 1,
+    granular_mode: int = 0,
+    granular_wait_weight: float = 0.2,
+    granular_time_warp_weight: float = 1.0,
     elite_k: int = 8,
     elite_min_diversity: float = 0.15,
     elite_cost_tolerance: float = 1.05,
@@ -367,9 +371,14 @@ def infer_instance(
         fixed_steps=fixed_steps,
         nls=nls,
         T_nls=T_nls,
+        granular_mode=granular_mode,
+        granular_wait_weight=granular_wait_weight,
+        granular_time_warp_weight=granular_time_warp_weight,
     )
     solver.seed_rng(seed)
 
+    mini_H = max(1, int(mini_H))
+    total_iter = n_iter * mini_H
     log_steps = list(range(log_period, n_iter + 1, log_period))
     if not log_steps or log_steps[-1] != n_iter:
         log_steps.append(n_iter)
@@ -415,14 +424,16 @@ def infer_instance(
     start = time.time()
     log_group_idx = 0
     iter_prior = current_prior() if ppo_model is not None and ppo_prior_refresh == "outer" else static_prior
-    for t in range(n_iter):
-        is_log_step = (t + 1) in log_step_set
-        is_group_start = t % log_period == 0
+    for t in range(total_iter):
+        outer_step = (t // mini_H) + 1
+        inner_step = (t % mini_H) + 1
+        is_log_step = inner_step == mini_H and outer_step in log_step_set
+        is_group_start = inner_step == 1 and (outer_step - 1) % log_period == 0
         if is_group_start:
             iter_prior = current_prior() if ppo_model is not None and ppo_prior_refresh == "outer" else static_prior
         iter_prior_fn = current_prior if ppo_model is not None and ppo_prior_refresh == "sample" else None
 
-        if is_log_step and elite_source_period > 0 and (t + 1) % elite_source_period == 0 and len(elite_archive) > 1:
+        if is_log_step and elite_source_period > 0 and outer_step % elite_source_period == 0 and len(elite_archive) > 1:
             costs_np, routes = sample_multisource(
                 solver,
                 elite_archive,
@@ -431,7 +442,7 @@ def infer_instance(
                 prior=iter_prior,
             )
         else:
-            if is_log_step and elite_source_period > 0 and (t + 1) % elite_source_period == 0:
+            if is_log_step and elite_source_period > 0 and outer_step % elite_source_period == 0:
                 elite_source = select_elite_source(elite_archive, log_group_idx)
                 if elite_source is not None:
                     solver.set_source_route(elite_source["route"], elite_source["cost"])
@@ -470,7 +481,7 @@ def infer_instance(
     return results, diversities, elapsed, log_steps
 
 
-def test(dataset, n_ants: int, n_iter: int, log_period: int, threads: int | None, seed: int, **solver_kwargs):
+def test(dataset, n_ants: int, n_iter: int, log_period: int, threads: int | None, seed: int, mini_H: int = 1, **solver_kwargs):
     log_steps = list(range(log_period, n_iter + 1, log_period))
     if not log_steps or log_steps[-1] != n_iter:
         log_steps.append(n_iter)
@@ -491,6 +502,7 @@ def test(dataset, n_ants: int, n_iter: int, log_period: int, threads: int | None
             log_period=log_period,
             threads=threads,
             seed=seed + idx,
+            mini_H=mini_H,
             **solver_kwargs,
         )
         sum_results += results
@@ -517,6 +529,7 @@ def write_results(
     avg_cost,
     avg_diversity,
     log_steps: list[int],
+    mini_H: int = 1,
     data_source: str = "gfacs",
     rl4co_phase: str = "test",
     rl4co_file: str | Path | None = None,
@@ -557,6 +570,7 @@ def write_results(
         f.write(f"ppo_prior_center: {ppo_prior_center}\n")
         f.write(f"n_ants: {n_ants}\n")
         f.write(f"log_period: {log_period}\n")
+        f.write(f"mini_H: {mini_H}\n")
         f.write(f"elite_source_period: {elite_source_period}\n")
         f.write(f"threads: {threads if threads is not None else 'default'}\n")
         f.write(f"seed: {seed}\n")
@@ -577,6 +591,7 @@ def main(
     size: int | None = None,
     n_ants: int = 100,
     n_iter: int = 10,
+    mini_H: int = 1,
     log_period: int = 1,
     elite_source_period: int = 1,
     threads: int | None = None,
@@ -604,6 +619,9 @@ def main(
     fixed_steps: int = 0,
     nls: bool = False,
     T_nls: int = 10,
+    granular_mode: int = 0,
+    granular_wait_weight: float = 0.2,
+    granular_time_warp_weight: float = 1.0,
     elite_k: int = 8,
     elite_min_diversity: float = 0.15,
     elite_cost_tolerance: float = 1.05,
@@ -702,6 +720,7 @@ def main(
         n_ants=n_ants,
         n_iter=n_iter,
         log_period=log_period,
+        mini_H=mini_H,
         threads=threads,
         seed=seed,
         cand_list_size=cand_list_size,
@@ -717,6 +736,9 @@ def main(
         fixed_steps=fixed_steps,
         nls=nls,
         T_nls=T_nls,
+        granular_mode=granular_mode,
+        granular_wait_weight=granular_wait_weight,
+        granular_time_warp_weight=granular_time_warp_weight,
         elite_k=elite_k,
         elite_min_diversity=elite_min_diversity,
         elite_cost_tolerance=elite_cost_tolerance,
@@ -743,7 +765,7 @@ def main(
     out_dir = Path(output_dir) if output_dir is not None else ROOT_DIR / "pretrained" / "cvrptw" / str(n_nodes) / "faco"
     result_filename = (
         f"test_result_ckpt{checkpoint_type}-{data_source}-{problem_name}{n_nodes}-ninst{size}-"
-        f"nants{n_ants}-niter{n_iter}-logperiod{log_period}-eliteperiod{elite_source_period}-threads{threads if threads is not None else 'default'}-seed{seed}-faco"
+        f"nants{n_ants}-niter{n_iter}-miniH{mini_H}-logperiod{log_period}-eliteperiod{elite_source_period}-gmode{granular_mode}-threads{threads if threads is not None else 'default'}-seed{seed}-faco"
     )
     result_txt = out_dir / f"{result_filename}.txt"
     result_csv = out_dir / f"{result_filename}.csv"
@@ -756,6 +778,7 @@ def main(
         n_ants=n_ants,
         n_iter=n_iter,
         log_period=log_period,
+        mini_H=mini_H,
         elite_source_period=elite_source_period,
         threads=threads,
         seed=seed,
@@ -787,6 +810,7 @@ def parse_args():
     parser.add_argument("nodes", type=int, help="Problem scale")
     parser.add_argument("-k", "--k_sparse", type=int, default=None, help="k_sparse / default FACO candidate list size")
     parser.add_argument("-i", "--n_iter", type=int, default=10, help="Number of FACO iterations")
+    parser.add_argument("--mini_H", type=int, default=1, help="Number of inner FACO samples per logged iteration")
     parser.add_argument("--threads", type=int, default=None, help="OpenMP thread count for parallel C++ FACO sampling/update")
     parser.add_argument("-n", "--n_ants", type=int, default=100, help="Number of ants")
     parser.add_argument("-s", "--size", type=int, default=None, help="Number of instances to test")
@@ -815,6 +839,9 @@ def parse_args():
     parser.add_argument("--fixed_steps", type=int, default=0, help="Fixed sampler steps; 0 means default")
     parser.add_argument("--nls", action="store_true", help="Enable NLS mode")
     parser.add_argument("--T_nls", type=int, default=10, help="Number of NLS iterations")
+    parser.add_argument("--granular_mode", type=int, default=0, choices=[0, 1], help="FACO KNN mode: 0 euclidean, 1 spatio-temporal")
+    parser.add_argument("--granular_wait_weight", type=float, default=0.2, help="Weight for minimum wait time in granular KNN")
+    parser.add_argument("--granular_time_warp_weight", type=float, default=1.0, help="Weight for minimum time warp in granular KNN")
     parser.add_argument("--elite_k", type=int, default=8, help="Number of quality-diverse elite source routes")
     parser.add_argument("--elite_min_diversity", type=float, default=0.15, help="Minimum edge distance between elite source routes")
     parser.add_argument("--elite_cost_tolerance", type=float, default=1.05, help="Maximum elite source cost ratio versus current best")
@@ -844,6 +871,7 @@ if __name__ == "__main__":
         size=args.size,
         n_ants=args.n_ants,
         n_iter=args.n_iter,
+        mini_H=args.mini_H,
         log_period=args.log_period,
         threads=args.threads,
         seed=args.seed,
@@ -870,6 +898,9 @@ if __name__ == "__main__":
         fixed_steps=args.fixed_steps,
         nls=args.nls,
         T_nls=args.T_nls,
+        granular_mode=args.granular_mode,
+        granular_wait_weight=args.granular_wait_weight,
+        granular_time_warp_weight=args.granular_time_warp_weight,
         elite_k=args.elite_k,
         elite_min_diversity=args.elite_min_diversity,
         elite_cost_tolerance=args.elite_cost_tolerance,

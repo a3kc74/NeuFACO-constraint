@@ -346,7 +346,9 @@ public:
       float decay = 0.9f, float alpha = 1.0f, float p_best = 0.05f,
       bool use_local_search = true, bool disable_heuristic = false,
       bool extend_ls = false, bool smooth_mmas = false,
-      int32_t fixed_steps = 0, bool nls = false, int32_t T_nls = 10)
+      int32_t fixed_steps = 0, bool nls = false, int32_t T_nls = 10,
+      int32_t granular_mode = 0, float granular_wait_weight = 0.2f,
+      float granular_time_warp_weight = 1.0f)
       : PyMFACO_CVRP(coords, demand, capacity, n_ants, cand_list_size,
                      backup_list_size, min_new_edges, decay, alpha, p_best,
                      use_local_search, disable_heuristic, extend_ls,
@@ -357,6 +359,9 @@ public:
         wbuf.shape[1] != 2) {
       throw std::runtime_error("windows must be shape (n,2) matching coords");
     }
+    solver->granular_mode = granular_mode;
+    solver->granular_wait_weight = granular_wait_weight;
+    solver->granular_time_warp_weight = granular_time_warp_weight;
     solver->set_time_windows((const float *)wbuf.ptr);
   }
 };
@@ -467,7 +472,8 @@ PYBIND11_MODULE(faco_opt, m) {
                py::array_t<float, py::array::c_style | py::array::forcecast>,
                py::array_t<float, py::array::c_style | py::array::forcecast>,
                float, int32_t, int32_t, int32_t, int32_t, float, float, float,
-               bool, bool, bool, bool, int32_t, bool, int32_t>(),
+               bool, bool, bool, bool, int32_t, bool, int32_t, int32_t, float,
+               float>(),
            py::arg("coords"), py::arg("demand"), py::arg("windows"),
            py::arg("capacity"), py::arg("n_ants"),
            py::arg("cand_list_size") = 32, py::arg("backup_list_size") = 32,
@@ -477,7 +483,9 @@ PYBIND11_MODULE(faco_opt, m) {
            py::arg("disable_heuristic") = false,
            py::arg("extend_ls") = false, py::arg("smooth_mmas") = false,
            py::arg("fixed_steps") = 0, py::arg("nls") = false,
-           py::arg("T_nls") = 10)
+           py::arg("T_nls") = 10, py::arg("granular_mode") = 0,
+           py::arg("granular_wait_weight") = 0.2f,
+           py::arg("granular_time_warp_weight") = 1.0f)
       .def_property_readonly("n", &PyMFACO_CVRPTW::get_n)
       .def_property_readonly("m", &PyMFACO_CVRPTW::get_m)
       .def_property_readonly("n_ants", &PyMFACO_CVRPTW::get_n_ants)
