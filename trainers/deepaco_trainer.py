@@ -1,4 +1,3 @@
-import math
 import os
 import random
 import time
@@ -7,15 +6,16 @@ from tqdm import tqdm
 import numpy as np
 import torch
 
+from envs.gfacs_data import gen_instance, gen_pyg_data, load_val_dataset
+from evaluation import faco_test
 from models.gfacs_net import Net
-from solvers.gfacs_aco import ACO
-from envs.gfacs_data import gen_pyg_data, load_val_dataset, gen_instance
+from solvers.faco import MFACO_CVRPTW, set_faco_cpp_threads
+from trainers.dynaco_ppo_trainer import replay_logp_from_trace
 
 try:
     import wandb
 except ImportError:  # pragma: no cover - wandb is optional for local smoke tests
     wandb = None
-
 
 EPS = 1e-10
 T = 5
@@ -23,12 +23,120 @@ DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 USE_WANDB = False
 TAM = False
 
+DEFAULT_FACO_PARAMS = {
+    "log_period": 1,
+    "threads": 1,
+    "backup_list_size": 64,
+    "min_new_edges": 8,
+    "decay": 0.9,
+    "alpha": 1.0,
+    "p_best": 0.05,
+    "use_local_search": True,
+    "disable_heuristic": False,
+    "extend_ls": False,
+    "smooth_mmas": False,
+    "fixed_steps": 0,
+    "nls": False,
+    "T_nls": 10,
+    "granular_mode": 0,
+    "granular_wait_weight": 0.2,
+    "granular_time_warp_weight": 1.0,
+    "hgs_soft_deep_ls": False,
+    "hgs_soft_cheap_ls": False,
+    "hgs_soft_intra_ls": False,
+    "hgs_deep_ls": False,
+    "hgs_deep_top_k": 0,
+    "hgs_tw_penalty": 10.0,
+    "hgs_capacity_penalty": 10.0,
+    "hgs_adaptive_penalty": False,
+    "hgs_target_feasible": 0.8,
+    "hgs_deep_rounds": 1,
+    "hgs_deep_route_pair_prune": False,
+    "hgs_deep_route_pair_top_k": 3,
+    "parallel_traced": False,
+    "deepaco_prior_scale": 1.0,
+    "deepaco_prior_center": False,
+}
 
-def deepaco_reinforce_loss(costs: torch.Tensor, log_probs: torch.Tensor, reward_costs: torch.Tensor | None = None) -> torch.Tensor:
-    """REINFORCE loss used by DeepACO, with a per-instance mean-cost baseline."""
+
+def deepaco_reinforce_loss(
+    costs: torch.Tensor,
+    log_probs: torch.Tensor,
+    reward_costs: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """DeepACO REINFORCE loss with a per-instance mean-cost baseline."""
     costs_for_reward = costs if reward_costs is None else reward_costs
     advantages = costs_for_reward - costs_for_reward.mean()
-    return torch.sum(advantages.detach() * log_probs.sum(dim=0)) / log_probs.size(1)
+    path_log_probs = log_probs if log_probs.dim() == 1 else log_probs.sum(dim=0)
+    return torch.sum(advantages.detach() * path_log_probs) / costs.numel()
+
+
+def merged_faco_params(faco_params: dict | None = None) -> dict:
+    return {**DEFAULT_FACO_PARAMS, **(faco_params or {})}
+
+
+def faco_solver_kwargs(params: dict, n_ants: int, cand_list_size: int) -> dict:
+    return {
+        "n_ants": n_ants,
+        "cand_list_size": cand_list_size,
+        "backup_list_size": params["backup_list_size"],
+        "min_new_edges": params["min_new_edges"],
+        "decay": params["decay"],
+        "alpha": params["alpha"],
+        "p_best": params["p_best"],
+        "use_local_search": params["use_local_search"],
+        "disable_heuristic": params["disable_heuristic"],
+        "extend_ls": params["extend_ls"],
+        "smooth_mmas": params["smooth_mmas"],
+        "device": "cpu",
+        "fixed_steps": params["fixed_steps"],
+        "nls": params["nls"],
+        "T_nls": params["T_nls"],
+        "granular_mode": params["granular_mode"],
+        "granular_wait_weight": params["granular_wait_weight"],
+        "granular_time_warp_weight": params["granular_time_warp_weight"],
+        "hgs_soft_deep_ls": params["hgs_soft_deep_ls"],
+        "hgs_soft_cheap_ls": params["hgs_soft_cheap_ls"],
+        "hgs_soft_intra_ls": params["hgs_soft_intra_ls"],
+        "hgs_deep_ls": params["hgs_deep_ls"],
+        "hgs_deep_top_k": params["hgs_deep_top_k"],
+        "hgs_tw_penalty": params["hgs_tw_penalty"],
+        "hgs_capacity_penalty": params["hgs_capacity_penalty"],
+        "hgs_adaptive_penalty": params["hgs_adaptive_penalty"],
+        "hgs_target_feasible": params["hgs_target_feasible"],
+        "hgs_deep_rounds": params["hgs_deep_rounds"],
+        "hgs_deep_route_pair_prune": params["hgs_deep_route_pair_prune"],
+        "hgs_deep_route_pair_top_k": params["hgs_deep_route_pair_top_k"],
+    }
+
+
+def build_faco_solver(demands, positions, windows, n_ants: int, cand_list_size: int, params: dict):
+    return MFACO_CVRPTW(
+        positions,
+        demands,
+        windows,
+        capacity=1.0,
+        **faco_solver_kwargs(params, n_ants, cand_list_size),
+    )
+
+
+def sparse_deepaco_prior_tensor(
+    model,
+    pyg_data,
+    solver,
+    prior_scale: float = 1.0,
+    prior_center: bool = False,
+) -> torch.Tensor:
+    heuristic_mat = model.reshape(pyg_data, model(pyg_data))
+    nn_list = torch.as_tensor(np.asarray(solver.nn_list), dtype=torch.long, device=heuristic_mat.device)
+    rows = torch.arange(nn_list.shape[0], device=heuristic_mat.device).unsqueeze(1)
+    sparse_heuristic = heuristic_mat[rows, nn_list]
+    prior = torch.log(sparse_heuristic.to(torch.float32).clamp_min(EPS))
+    if prior_center:
+        prior = prior - prior.mean(dim=1, keepdim=True)
+    if prior_scale != 1.0:
+        prior = prior * float(prior_scale)
+    return prior
 
 
 def train_instance(
@@ -40,8 +148,12 @@ def train_instance(
     use_ls_reward=False,
     it=0,
     local_search_params=None,
+    faco_params=None,
+    k_sparse=None,
 ):
     model.train()
+    params = merged_faco_params(faco_params)
+    cand_list_size = k_sparse or params.get("cand_list_size") or n_ants
 
     train_mean_cost = 0.0
     train_min_cost = 0.0
@@ -53,28 +165,33 @@ def train_instance(
     count = 0
 
     for pyg_data, demands, distances, positions, windows in data:
-        heu_vec = model(pyg_data)
-        heu_mat = model.reshape(pyg_data, heu_vec) + EPS
-
-        aco = ACO(
-            distances=distances.to(DEVICE),
-            demands=demands.to(DEVICE),
-            windows=windows.to(DEVICE),
-            n_ants=n_ants,
-            heuristic=heu_mat.to(DEVICE),
-            device=DEVICE,
-            use_local_search=use_ls_reward,
-            local_search_params=local_search_params,
-            positions=positions,
+        solver = build_faco_solver(demands, positions, windows, n_ants, cand_list_size, params)
+        tau = solver.pheromone_sparse.detach().clone().to(DEVICE)
+        eta = solver.h_sparse_torch.detach().clone().to(DEVICE)
+        prior_logits = sparse_deepaco_prior_tensor(
+            model,
+            pyg_data,
+            solver,
+            prior_scale=params["deepaco_prior_scale"],
+            prior_center=params["deepaco_prior_center"],
         )
-
-        costs, log_probs, paths = aco.sample(invtemp=invtemp)
+        costs, _, _, _, traces, _, _, _, _ = solver.sample(
+            require_prob=True,
+            prior=prior_logits.detach().cpu().numpy(),
+            parallel_traced=params["parallel_traced"],
+        )
+        costs = torch.as_tensor(costs, dtype=torch.float32, device=DEVICE)
+        replay_logp, _, _ = replay_logp_from_trace(
+            traces,
+            tau,
+            eta,
+            prior_logits,
+            alpha=params["alpha"],
+            disable_heuristic=params["disable_heuristic"],
+            return_decision_counts=True,
+        )
         reward_costs = costs
-        if use_ls_reward:
-            paths_ls = aco.local_search(paths, inference=False)
-            reward_costs = aco.gen_path_costs(paths_ls)
-
-        loss = deepaco_reinforce_loss(costs, log_probs, reward_costs=reward_costs)
+        loss = deepaco_reinforce_loss(costs, replay_logp, reward_costs=reward_costs)
         sum_loss += loss
         count += 1
 
@@ -83,10 +200,8 @@ def train_instance(
             train_min_cost += costs.min().item()
             train_mean_reward_cost += reward_costs.mean().item()
             train_min_reward_cost += reward_costs.min().item()
-
-            normed_heumat = heu_mat / heu_mat.sum(dim=1, keepdim=True)
-            entropy = -(normed_heumat * torch.log(normed_heumat)).sum(dim=1).mean()
-            train_entropy += entropy.item()
+            prob_prior = torch.softmax(prior_logits, dim=1)
+            train_entropy += (-(prob_prior * torch.log(prob_prior.clamp_min(EPS))).sum(dim=1).mean()).item()
 
     sum_loss = sum_loss / count
 
@@ -105,37 +220,73 @@ def train_instance(
                 "train_entropy": train_entropy / count,
                 "train_loss": sum_loss.item(),
                 "invtemp": invtemp,
-                "use_ls_reward": use_ls_reward,
+                "use_ls_reward": False,
             },
             step=it,
         )
 
 
 @torch.no_grad()
-def infer_instance(model, pyg_data, demands, distances, positions, windows, n_ants, local_search_params=None):
+def infer_instance(
+    model,
+    pyg_data,
+    demands,
+    distances,
+    positions,
+    windows,
+    n_ants,
+    local_search_params=None,
+    faco_params=None,
+    k_sparse=None,
+):
     model.eval()
-    heu_vec = model(pyg_data)
-    heu_mat = model.reshape(pyg_data, heu_vec) + EPS
-
-    aco = ACO(
-        distances=distances,
-        demands=demands,
-        windows=windows,
-        positions=positions,
+    params = merged_faco_params(faco_params)
+    cand_list_size = k_sparse or params.get("cand_list_size") or n_ants
+    results, diversities, *_ = faco_test.infer_instance(
+        demands,
+        positions,
+        windows,
         n_ants=n_ants,
-        heuristic=heu_mat,
-        device=DEVICE,
-        use_local_search=True,
-        local_search_params=local_search_params,
+        n_iter=params.get("val_n_iter", T),
+        threads=params["threads"],
+        seed=params.get("seed", 0),
+        cand_list_size=cand_list_size,
+        backup_list_size=params["backup_list_size"],
+        min_new_edges=params["min_new_edges"],
+        decay=params["decay"],
+        alpha=params["alpha"],
+        p_best=params["p_best"],
+        use_local_search=params["use_local_search"],
+        disable_heuristic=params["disable_heuristic"],
+        extend_ls=params["extend_ls"],
+        smooth_mmas=params["smooth_mmas"],
+        fixed_steps=params["fixed_steps"],
+        nls=params["nls"],
+        T_nls=params["T_nls"],
+        log_period=params["log_period"],
+        granular_mode=params["granular_mode"],
+        granular_wait_weight=params["granular_wait_weight"],
+        granular_time_warp_weight=params["granular_time_warp_weight"],
+        hgs_soft_deep_ls=params["hgs_soft_deep_ls"],
+        hgs_soft_cheap_ls=params["hgs_soft_cheap_ls"],
+        hgs_soft_intra_ls=params["hgs_soft_intra_ls"],
+        hgs_deep_ls=params["hgs_deep_ls"],
+        hgs_deep_top_k=params["hgs_deep_top_k"],
+        hgs_tw_penalty=params["hgs_tw_penalty"],
+        hgs_capacity_penalty=params["hgs_capacity_penalty"],
+        hgs_adaptive_penalty=params["hgs_adaptive_penalty"],
+        hgs_target_feasible=params["hgs_target_feasible"],
+        hgs_deep_rounds=params["hgs_deep_rounds"],
+        hgs_deep_route_pair_prune=params["hgs_deep_route_pair_prune"],
+        hgs_deep_route_pair_top_k=params["hgs_deep_route_pair_top_k"],
+        deepaco_model=model,
+        deepaco_k_sparse=cand_list_size,
+        deepaco_device=DEVICE,
+        deepaco_prior_scale=params["deepaco_prior_scale"],
+        deepaco_prior_center=params["deepaco_prior_center"],
+        distances=distances,
     )
-
-    costs = aco.sample()[0]
-    baseline = costs.mean().item()
-    best_sample_cost = costs.min().item()
-
-    best_aco_1, diversity_1, _ = aco.run(n_iterations=1)
-    best_aco_T, diversity_T, _ = aco.run(n_iterations=T - 1)
-    return np.array([baseline, best_sample_cost, best_aco_1, best_aco_T, diversity_1, diversity_T])
+    return np.array([float(results[-1]), float(diversities[-1])])
 
 
 def generate_traindata(count, n_node, k_sparse, vrptw=False):
@@ -157,36 +308,33 @@ def train_epoch(
     use_ls_reward=False,
     local_search_params=None,
     vrptw=False,
+    faco_params=None,
 ):
     for i in tqdm(range(steps_per_epoch), desc="Train", dynamic_ncols=True):
         it = (epoch - 1) * steps_per_epoch + i
         data = generate_traindata(batch_size, n_node, k_sparse, vrptw=vrptw)
-        train_instance(net, optimizer, data, n_ants, invtemp, use_ls_reward, it, local_search_params)
+        train_instance(net, optimizer, data, n_ants, invtemp, use_ls_reward, it, local_search_params, faco_params, k_sparse)
 
 
 @torch.no_grad()
-def validation(val_list, n_ants, net, epoch, steps_per_epoch, local_search_params=None):
+def validation(val_list, n_ants, net, epoch, steps_per_epoch, local_search_params=None, faco_params=None, k_sparse=None):
     stats = []
     for data, demands, distances, positions, windows in tqdm(val_list, desc="Val", dynamic_ncols=True):
-        stats.append(infer_instance(net, data, demands, distances, positions, windows, n_ants, local_search_params))
+        stats.append(infer_instance(net, data, demands, distances, positions, windows, n_ants, local_search_params, faco_params, k_sparse))
     avg_stats = [i.item() for i in np.stack(stats).mean(0)]
 
     print(f"epoch {epoch}:", avg_stats)
     if USE_WANDB and wandb is not None:
         wandb.log(
             {
-                "val_baseline": avg_stats[0],
-                "val_best_sample_cost": avg_stats[1],
-                "val_best_aco_1": avg_stats[2],
-                "val_best_aco_T": avg_stats[3],
-                "val_diversity_1": avg_stats[4],
-                "val_diversity_T": avg_stats[5],
+                "val_faco_final_cost": avg_stats[0],
+                "val_faco_final_diversity": avg_stats[1],
                 "epoch": epoch,
             },
             step=epoch * steps_per_epoch,
         )
 
-    return avg_stats[3]
+    return avg_stats[0]
 
 
 def train(
@@ -207,6 +355,7 @@ def train(
     use_ls_reward=False,
     local_search_params=None,
     vrptw=False,
+    faco_params=None,
 ):
     savepath = os.path.join(savepath, str(n_nodes), run_name)
     os.makedirs(savepath, exist_ok=True)
@@ -217,10 +366,11 @@ def train(
     optimizer = torch.optim.AdamW(net.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs, eta_min=lr * 0.1)
 
+    os.makedirs("../data/cvrptw", exist_ok=True)
     val_list = load_val_dataset(n_nodes, k_sparse, DEVICE, TAM, vrptw=vrptw)
     val_list = val_list[:(val_size or len(val_list))]
 
-    best_result = validation(val_list, n_val_ants, net, 0, steps_per_epoch, local_search_params)
+    best_result = validation(val_list, n_val_ants, net, 0, steps_per_epoch, local_search_params, faco_params, k_sparse)
 
     sum_time = 0
     for epoch in range(1, epochs + 1):
@@ -242,11 +392,12 @@ def train(
             use_ls_reward,
             local_search_params,
             vrptw,
+            faco_params,
         )
         sum_time += time.time() - start
 
         if epoch % val_interval == 0:
-            curr_result = validation(val_list, n_val_ants, net, epoch, steps_per_epoch, local_search_params)
+            curr_result = validation(val_list, n_val_ants, net, epoch, steps_per_epoch, local_search_params, faco_params, k_sparse)
             if curr_result < best_result:
                 torch.save(net.state_dict(), os.path.join(savepath, "best.pt"))
                 best_result = curr_result
@@ -261,11 +412,11 @@ def train(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Train a DeepACO-style REINFORCE model for CVRPTW using GFACS ACO sampling/inference.")
+    parser = argparse.ArgumentParser(description="Train DeepACO for CVRPTW using FACO sampling and inference.")
     parser.add_argument("nodes", metavar="N", type=int, help="Problem scale")
-    parser.add_argument("-k", "--k_sparse", type=int, default=None, help="k_sparse")
+    parser.add_argument("-k", "--k_sparse", type=int, default=None, help="Sparse candidate-list size")
     parser.add_argument("-l", "--lr", metavar="eta", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("-d", "--device", type=str, default=("cuda:0" if torch.cuda.is_available() else "cpu"), help="The device to train NNs")
+    parser.add_argument("-d", "--device", type=str, default=("cuda:0" if torch.cuda.is_available() else "cpu"), help="Device for training NNs")
     parser.add_argument("-p", "--pretrained", type=str, default=None, help="Path to pretrained model")
     parser.add_argument("-a", "--ants", type=int, default=20, help="Number of ants for training")
     parser.add_argument("-va", "--val_ants", type=int, default=50, help="Number of ants for validation")
@@ -273,22 +424,56 @@ if __name__ == "__main__":
     parser.add_argument("-s", "--steps", type=int, default=20, help="Steps per epoch")
     parser.add_argument("-e", "--epochs", type=int, default=50, help="Epochs to run")
     parser.add_argument("-v", "--val_size", type=int, default=10, help="Number of instances for validation")
-    parser.add_argument("-o", "--output", type=str, default="../pretrained/cvrptw-deepaco", help="The directory to store checkpoints")
-    parser.add_argument("--val_interval", type=int, default=5, help="The interval to validate model")
+    parser.add_argument("-o", "--output", type=str, default="/pretrained/cvrptw-deepaco", help="Directory to store checkpoints")
+    parser.add_argument("--val_interval", type=int, default=5, help="Interval to validate model")
     parser.add_argument("--disable_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--run_name", type=str, default="", help="Run name")
-    parser.add_argument("--invtemp_min", type=float, default=1.0, help="ACO sampling inverse temperature min")
-    parser.add_argument("--invtemp_max", type=float, default=1.0, help="ACO sampling inverse temperature max")
-    parser.add_argument("--invtemp_flat_epochs", type=int, default=5, help="Inverse temperature flat epochs")
-    parser.add_argument("--use_ls_reward", action="store_true", help="Use PyVRP local-search-improved paths to compute REINFORCE reward costs")
+    parser.add_argument("--invtemp_min", type=float, default=1.0, help="Kept for schedule compatibility")
+    parser.add_argument("--invtemp_max", type=float, default=1.0, help="Kept for schedule compatibility")
+    parser.add_argument("--invtemp_flat_epochs", type=int, default=5, help="Kept for schedule compatibility")
+    parser.add_argument("--use_ls_reward", action="store_true", help="Deprecated: FACO sample costs are used for reward")
     parser.add_argument("--tam", action="store_true", help="Use TAM dataset")
     parser.add_argument("--vrptw", action="store_true", help="Use VRPTW mode by setting all customer demands to zero")
-    parser.add_argument("--n_cpus", type=int, default=1, help="Number of cpus for local search")
-    parser.add_argument("--max_trials", type=int, default=10, help="Number of local search trials")
-    parser.add_argument("--load_penalty", type=int, default=20, help="Initial load_penalty in training phase")
-    parser.add_argument("--tw_penalty", type=int, default=20, help="Initial tw_penalty in training phase")
-    parser.add_argument("--nb_granular", type=int, default=None, help="Granularity of neighbourhood search")
+    parser.add_argument("--n_cpus", type=int, default=1, help="Deprecated PyVRP LS compatibility parameter")
+    parser.add_argument("--max_trials", type=int, default=10, help="Deprecated PyVRP LS compatibility parameter")
+    parser.add_argument("--load_penalty", type=int, default=20, help="Deprecated PyVRP LS compatibility parameter")
+    parser.add_argument("--tw_penalty", type=int, default=20, help="Deprecated PyVRP LS compatibility parameter")
+    parser.add_argument("--nb_granular", type=int, default=None, help="Deprecated PyVRP LS compatibility parameter")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
+
+    parser.add_argument("--val_n_iter", type=int, default=T, help="FACO validation iterations")
+    parser.add_argument("--log_period", type=int, default=1, help="FACO validation log period")
+    parser.add_argument("--threads", type=int, default=1, help="FACO C++ threads")
+    parser.add_argument("--backup_list_size", type=int, default=64)
+    parser.add_argument("--min_new_edges", type=int, default=8)
+    parser.add_argument("--decay", type=float, default=0.9)
+    parser.add_argument("--alpha", type=float, default=1.0)
+    parser.add_argument("--p_best", type=float, default=0.05)
+    parser.add_argument("--disable_local_search", action="store_true")
+    parser.add_argument("--disable_heuristic", action="store_true")
+    parser.add_argument("--extend_ls", action="store_true")
+    parser.add_argument("--smooth_mmas", action="store_true")
+    parser.add_argument("--fixed_steps", type=int, default=0)
+    parser.add_argument("--nls", action="store_true")
+    parser.add_argument("--T_nls", type=int, default=10)
+    parser.add_argument("--granular_mode", type=int, default=0)
+    parser.add_argument("--granular_wait_weight", type=float, default=0.2)
+    parser.add_argument("--granular_time_warp_weight", type=float, default=1.0)
+    parser.add_argument("--hgs_soft_deep_ls", action="store_true")
+    parser.add_argument("--hgs_soft_cheap_ls", action="store_true")
+    parser.add_argument("--hgs_soft_intra_ls", action="store_true")
+    parser.add_argument("--hgs_deep_ls", action="store_true")
+    parser.add_argument("--hgs_deep_top_k", type=int, default=0)
+    parser.add_argument("--hgs_tw_penalty", type=float, default=10.0)
+    parser.add_argument("--hgs_capacity_penalty", type=float, default=10.0)
+    parser.add_argument("--hgs_adaptive_penalty", action="store_true")
+    parser.add_argument("--hgs_target_feasible", type=float, default=0.8)
+    parser.add_argument("--hgs_deep_rounds", type=int, default=1)
+    parser.add_argument("--hgs_deep_route_pair_prune", action="store_true")
+    parser.add_argument("--hgs_deep_route_pair_top_k", type=int, default=3)
+    parser.add_argument("--parallel_traced", action="store_true")
+    parser.add_argument("--deepaco_prior_scale", type=float, default=1.0)
+    parser.add_argument("--deepaco_prior_center", action="store_true")
 
     args = parser.parse_args()
 
@@ -300,6 +485,7 @@ if __name__ == "__main__":
     DEVICE = args.device if torch.cuda.is_available() else "cpu"
     USE_WANDB = not args.disable_wandb
     TAM = args.tam
+    set_faco_cpp_threads(args.threads)
 
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
@@ -320,13 +506,49 @@ if __name__ == "__main__":
             raise ImportError("wandb is required unless --disable_wandb is set")
         wandb.init(project="deepaco-cvrptw", name=run_name)
         wandb.config.update(args)
-        wandb.config.update({"T": T, "model": "DeepACO", "tam": TAM, "vrptw": args.vrptw})
+        wandb.config.update({"T": T, "model": "DeepACO-FACO", "tam": TAM, "vrptw": args.vrptw})
 
     local_search_params = {
         "n_cpus": args.n_cpus,
         "max_trials": args.max_trials,
         "neighbourhood_params": {"nb_granular": args.nb_granular},
         "cost_evaluator_params": {"load_penalty": args.load_penalty, "tw_penalty": args.tw_penalty},
+    }
+    faco_params = {
+        "val_n_iter": args.val_n_iter,
+        "log_period": args.log_period,
+        "threads": args.threads,
+        "backup_list_size": args.backup_list_size,
+        "min_new_edges": args.min_new_edges,
+        "decay": args.decay,
+        "alpha": args.alpha,
+        "p_best": args.p_best,
+        "use_local_search": not args.disable_local_search,
+        "disable_heuristic": args.disable_heuristic,
+        "extend_ls": args.extend_ls,
+        "smooth_mmas": args.smooth_mmas,
+        "fixed_steps": args.fixed_steps,
+        "nls": args.nls,
+        "T_nls": args.T_nls,
+        "granular_mode": args.granular_mode,
+        "granular_wait_weight": args.granular_wait_weight,
+        "granular_time_warp_weight": args.granular_time_warp_weight,
+        "hgs_soft_deep_ls": args.hgs_soft_deep_ls,
+        "hgs_soft_cheap_ls": args.hgs_soft_cheap_ls,
+        "hgs_soft_intra_ls": args.hgs_soft_intra_ls,
+        "hgs_deep_ls": args.hgs_deep_ls,
+        "hgs_deep_top_k": args.hgs_deep_top_k,
+        "hgs_tw_penalty": args.hgs_tw_penalty,
+        "hgs_capacity_penalty": args.hgs_capacity_penalty,
+        "hgs_adaptive_penalty": args.hgs_adaptive_penalty,
+        "hgs_target_feasible": args.hgs_target_feasible,
+        "hgs_deep_rounds": args.hgs_deep_rounds,
+        "hgs_deep_route_pair_prune": args.hgs_deep_route_pair_prune,
+        "hgs_deep_route_pair_top_k": args.hgs_deep_route_pair_top_k,
+        "parallel_traced": args.parallel_traced,
+        "deepaco_prior_scale": args.deepaco_prior_scale,
+        "deepaco_prior_center": args.deepaco_prior_center,
+        "seed": args.seed,
     }
 
     train(
@@ -347,4 +569,5 @@ if __name__ == "__main__":
         use_ls_reward=args.use_ls_reward,
         local_search_params=local_search_params,
         vrptw=args.vrptw,
+        faco_params=faco_params,
     )
