@@ -212,3 +212,51 @@ def test_cvrptw_rejects_invalid_prior_shape():
 
     with pytest.raises(RuntimeError, match="prior must be shape"):
         solver.sample(prior=np.ones((solver.n, solver.k + 1), dtype=np.float32))
+
+def test_cvrptw_soft_intra_ls_flag_runs_feasible_solution():
+    coords, demand, windows, capacity = gfacs_instance(20)
+    solver = MFACO_CVRPTW(
+        coords,
+        demand,
+        windows,
+        capacity,
+        n_ants=4,
+        use_local_search=True,
+        cand_list_size=8,
+        hgs_soft_deep_ls=True,
+        hgs_soft_intra_ls=True,
+        hgs_tw_penalty=10.0,
+        hgs_capacity_penalty=10.0,
+    )
+    solver.seed_rng(23)
+
+    assert solver._cpp.hgs_soft_deep_ls is True
+    assert solver._cpp.hgs_soft_intra_ls is True
+    costs, routes, *_ = solver.sample()
+
+    assert_cvrptw_solution(coords, demand, windows, capacity, costs, routes)
+
+def test_cvrptw_deep_route_pair_pruning_flag_runs_feasible_solution():
+    coords, demand, windows, capacity = gfacs_instance(20)
+    solver = MFACO_CVRPTW(
+        coords,
+        demand,
+        windows,
+        capacity,
+        n_ants=4,
+        use_local_search=True,
+        cand_list_size=8,
+        hgs_soft_deep_ls=True,
+        hgs_deep_ls=True,
+        hgs_deep_top_k=1,
+        hgs_deep_rounds=2,
+        hgs_deep_route_pair_prune=True,
+        hgs_deep_route_pair_top_k=2,
+    )
+    solver.seed_rng(29)
+
+    assert solver._cpp.hgs_deep_route_pair_prune is True
+    assert solver._cpp.hgs_deep_route_pair_top_k == 2
+    costs, routes, *_ = solver.sample()
+
+    assert_cvrptw_solution(coords, demand, windows, capacity, costs, routes)

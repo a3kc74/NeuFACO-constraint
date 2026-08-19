@@ -329,6 +329,12 @@ public:
     d["time_ant"] = solver->time_ant;
     d["time_ls"] = solver->time_ls;
     d["time_split"] = solver->time_split;
+    d["time_inter_ls"] = solver->time_inter_ls;
+    d["time_intra_ls"] = solver->time_intra_ls;
+    d["time_deep_ls"] = solver->time_deep_ls;
+    d["count_inter_ls"] = solver->count_inter_ls;
+    d["count_intra_ls"] = solver->count_intra_ls;
+    d["count_deep_ls"] = solver->count_deep_ls;
     d["fts_checks"] = solver->fts_checks;
     d["fts_fallback_scans"] = solver->fts_fallback_scans;
     return d;
@@ -348,7 +354,14 @@ public:
       bool extend_ls = false, bool smooth_mmas = false,
       int32_t fixed_steps = 0, bool nls = false, int32_t T_nls = 10,
       int32_t granular_mode = 0, float granular_wait_weight = 0.2f,
-      float granular_time_warp_weight = 1.0f)
+      float granular_time_warp_weight = 1.0f, bool hgs_soft_deep_ls = false,
+      bool hgs_soft_cheap_ls = false, bool hgs_soft_intra_ls = false,
+      bool hgs_deep_ls = false, int32_t hgs_deep_top_k = 0,
+      float hgs_tw_penalty = 10.0f,
+      float hgs_capacity_penalty = 10.0f, bool hgs_adaptive_penalty = false,
+      float hgs_target_feasible = 0.8f, int32_t hgs_deep_rounds = 1,
+      bool hgs_deep_route_pair_prune = false,
+      int32_t hgs_deep_route_pair_top_k = 3)
       : PyMFACO_CVRP(coords, demand, capacity, n_ants, cand_list_size,
                      backup_list_size, min_new_edges, decay, alpha, p_best,
                      use_local_search, disable_heuristic, extend_ls,
@@ -362,6 +375,20 @@ public:
     solver->granular_mode = granular_mode;
     solver->granular_wait_weight = granular_wait_weight;
     solver->granular_time_warp_weight = granular_time_warp_weight;
+    solver->hgs_soft_deep_ls = hgs_soft_deep_ls;
+    solver->hgs_soft_cheap_ls = hgs_soft_cheap_ls;
+    solver->hgs_soft_intra_ls = hgs_soft_intra_ls;
+    solver->hgs_deep_ls = hgs_deep_ls;
+    solver->hgs_deep_top_k = hgs_deep_top_k;
+    solver->hgs_tw_penalty = hgs_tw_penalty;
+    solver->hgs_capacity_penalty = hgs_capacity_penalty;
+    solver->hgs_tw_penalty_current = hgs_tw_penalty;
+    solver->hgs_capacity_penalty_current = hgs_capacity_penalty;
+    solver->hgs_adaptive_penalty = hgs_adaptive_penalty;
+    solver->hgs_target_feasible = hgs_target_feasible;
+    solver->hgs_deep_rounds = hgs_deep_rounds;
+    solver->hgs_deep_route_pair_prune = hgs_deep_route_pair_prune;
+    solver->hgs_deep_route_pair_top_k = hgs_deep_route_pair_top_k;
     solver->set_time_windows((const float *)wbuf.ptr);
   }
 };
@@ -473,7 +500,7 @@ PYBIND11_MODULE(faco_opt, m) {
                py::array_t<float, py::array::c_style | py::array::forcecast>,
                float, int32_t, int32_t, int32_t, int32_t, float, float, float,
                bool, bool, bool, bool, int32_t, bool, int32_t, int32_t, float,
-               float>(),
+               float, bool, bool, bool, bool, int32_t, float, float, bool, float, int32_t, bool, int32_t>(),
            py::arg("coords"), py::arg("demand"), py::arg("windows"),
            py::arg("capacity"), py::arg("n_ants"),
            py::arg("cand_list_size") = 32, py::arg("backup_list_size") = 32,
@@ -485,7 +512,19 @@ PYBIND11_MODULE(faco_opt, m) {
            py::arg("fixed_steps") = 0, py::arg("nls") = false,
            py::arg("T_nls") = 10, py::arg("granular_mode") = 0,
            py::arg("granular_wait_weight") = 0.2f,
-           py::arg("granular_time_warp_weight") = 1.0f)
+           py::arg("granular_time_warp_weight") = 1.0f,
+           py::arg("hgs_soft_deep_ls") = false,
+           py::arg("hgs_soft_cheap_ls") = false,
+           py::arg("hgs_soft_intra_ls") = false,
+           py::arg("hgs_deep_ls") = false,
+           py::arg("hgs_deep_top_k") = 0,
+           py::arg("hgs_tw_penalty") = 10.0f,
+           py::arg("hgs_capacity_penalty") = 10.0f,
+           py::arg("hgs_adaptive_penalty") = false,
+           py::arg("hgs_target_feasible") = 0.8f,
+           py::arg("hgs_deep_rounds") = 1,
+           py::arg("hgs_deep_route_pair_prune") = false,
+           py::arg("hgs_deep_route_pair_top_k") = 3)
       .def_property_readonly("n", &PyMFACO_CVRPTW::get_n)
       .def_property_readonly("m", &PyMFACO_CVRPTW::get_m)
       .def_property_readonly("n_ants", &PyMFACO_CVRPTW::get_n_ants)
@@ -525,6 +564,60 @@ PYBIND11_MODULE(faco_opt, m) {
           "use_fts_checks",
           [](PyMFACO_CVRPTW &self) { return self.solver->use_fts_checks; },
           [](PyMFACO_CVRPTW &self, bool v) { self.solver->use_fts_checks = v; })
+      .def_property(
+          "hgs_soft_deep_ls",
+          [](PyMFACO_CVRPTW &self) { return self.solver->hgs_soft_deep_ls; },
+          [](PyMFACO_CVRPTW &self, bool v) { self.solver->hgs_soft_deep_ls = v; })
+      .def_property(
+          "hgs_soft_cheap_ls",
+          [](PyMFACO_CVRPTW &self) { return self.solver->hgs_soft_cheap_ls; },
+          [](PyMFACO_CVRPTW &self, bool v) { self.solver->hgs_soft_cheap_ls = v; })
+      .def_property(
+          "hgs_soft_intra_ls",
+          [](PyMFACO_CVRPTW &self) { return self.solver->hgs_soft_intra_ls; },
+          [](PyMFACO_CVRPTW &self, bool v) { self.solver->hgs_soft_intra_ls = v; })
+      .def_property(
+          "hgs_deep_ls",
+          [](PyMFACO_CVRPTW &self) { return self.solver->hgs_deep_ls; },
+          [](PyMFACO_CVRPTW &self, bool v) { self.solver->hgs_deep_ls = v; })
+      .def_property(
+          "hgs_deep_top_k",
+          [](PyMFACO_CVRPTW &self) { return self.solver->hgs_deep_top_k; },
+          [](PyMFACO_CVRPTW &self, int32_t v) { self.solver->hgs_deep_top_k = v; })
+      .def_property(
+          "hgs_tw_penalty",
+          [](PyMFACO_CVRPTW &self) { return self.solver->hgs_tw_penalty; },
+          [](PyMFACO_CVRPTW &self, float v) {
+            self.solver->hgs_tw_penalty = v;
+            self.solver->hgs_tw_penalty_current = v;
+          })
+      .def_property(
+          "hgs_capacity_penalty",
+          [](PyMFACO_CVRPTW &self) { return self.solver->hgs_capacity_penalty; },
+          [](PyMFACO_CVRPTW &self, float v) {
+            self.solver->hgs_capacity_penalty = v;
+            self.solver->hgs_capacity_penalty_current = v;
+          })
+      .def_property(
+          "hgs_adaptive_penalty",
+          [](PyMFACO_CVRPTW &self) { return self.solver->hgs_adaptive_penalty; },
+          [](PyMFACO_CVRPTW &self, bool v) { self.solver->hgs_adaptive_penalty = v; })
+      .def_property(
+          "hgs_target_feasible",
+          [](PyMFACO_CVRPTW &self) { return self.solver->hgs_target_feasible; },
+          [](PyMFACO_CVRPTW &self, float v) { self.solver->hgs_target_feasible = v; })
+      .def_property(
+          "hgs_deep_rounds",
+          [](PyMFACO_CVRPTW &self) { return self.solver->hgs_deep_rounds; },
+          [](PyMFACO_CVRPTW &self, int32_t v) { self.solver->hgs_deep_rounds = v; })
+      .def_property(
+          "hgs_deep_route_pair_prune",
+          [](PyMFACO_CVRPTW &self) { return self.solver->hgs_deep_route_pair_prune; },
+          [](PyMFACO_CVRPTW &self, bool v) { self.solver->hgs_deep_route_pair_prune = v; })
+      .def_property(
+          "hgs_deep_route_pair_top_k",
+          [](PyMFACO_CVRPTW &self) { return self.solver->hgs_deep_route_pair_top_k; },
+          [](PyMFACO_CVRPTW &self, int32_t v) { self.solver->hgs_deep_route_pair_top_k = v; })
       .def("reset_timings", &PyMFACO_CVRPTW::reset_timings)
       .def("get_timings", &PyMFACO_CVRPTW::get_timings);
 

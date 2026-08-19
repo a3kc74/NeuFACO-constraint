@@ -124,27 +124,27 @@ def select_elite_source(archive, step: int):
     return archive[(step + 1) % len(archive)]
 
 
-def load_gfacs_prior_model(checkpoint_path: str | Path, device: str, guided_exploration: bool | None = None):
+def load_deepaco_prior_model(checkpoint_path: str | Path, device: str):
     checkpoint_path = Path(checkpoint_path)
     if not checkpoint_path.is_file():
-        raise FileNotFoundError(f"GFACS checkpoint {checkpoint_path} not found")
+        raise FileNotFoundError(f"DeepACO checkpoint {checkpoint_path} not found")
 
     state_dict = torch.load(checkpoint_path, map_location=device)
     if not isinstance(state_dict, dict):
-        raise RuntimeError(f"GFACS checkpoint {checkpoint_path} must contain a state_dict")
+        raise RuntimeError(f"DeepACO checkpoint {checkpoint_path} must contain a state_dict")
 
-    if guided_exploration is None:
-        z_bias = state_dict.get("Z_net.2.bias")
-        z_out_dim = int(z_bias.numel()) if z_bias is not None else 1
-    else:
-        z_out_dim = 2 if guided_exploration else 1
-    model = OriginalGFACSNet(gfn=True, Z_out_dim=z_out_dim).to(device)
+    model = OriginalGFACSNet(gfn=False).to(device)
     model.load_state_dict(state_dict)
     model.eval()
     return model
 
 
-def gen_original_gfacs_pyg_data(demands, distances, windows, device: str, k_sparse: int):
+def load_gfacs_prior_model(checkpoint_path: str | Path, device: str, guided_exploration: bool | None = None):
+    del guided_exploration
+    return load_deepaco_prior_model(checkpoint_path, device)
+
+
+def gen_deepaco_pyg_data(demands, distances, windows, device: str, k_sparse: int):
     demands = torch.as_tensor(demands, dtype=torch.float32, device=device)
     distances = torch.as_tensor(distances, dtype=torch.float32, device=device)
     windows = torch.as_tensor(windows, dtype=torch.float32, device=device)
@@ -189,7 +189,7 @@ def build_instance_for_prior(demands, distances, windows):
 
 
 @torch.no_grad()
-def gfacs_prior(
+def deepaco_prior(
     model,
     instance,
     solver,
@@ -200,7 +200,7 @@ def gfacs_prior(
 ):
     if model is None:
         return None
-    pyg_data = gen_original_gfacs_pyg_data(
+    pyg_data = gen_deepaco_pyg_data(
         instance["demand"],
         instance["distances"],
         instance["windows"],
@@ -221,6 +221,9 @@ def gfacs_prior(
     return prior.detach().cpu().numpy().astype(np.float32, copy=False)
 
 
+# Deprecated compatibility aliases: faco_test now treats these as DeepACO prior helpers.
+gen_original_gfacs_pyg_data = gen_deepaco_pyg_data
+gfacs_prior = deepaco_prior
 
 
 def load_ppo_prior_model(checkpoint_path: str | Path, device: str, norm_type: str = "batch"):
@@ -318,21 +321,32 @@ def infer_instance(
     nls: bool,
     T_nls: int,
     log_period: int = 1,
-    mini_H: int = 1,
     granular_mode: int = 0,
     granular_wait_weight: float = 0.2,
     granular_time_warp_weight: float = 1.0,
+    hgs_soft_deep_ls: bool = False,
+    hgs_soft_cheap_ls: bool = False,
+    hgs_soft_intra_ls: bool = False,
+    hgs_deep_ls: bool = False,
+    hgs_deep_top_k: int = 0,
+    hgs_tw_penalty: float = 10.0,
+    hgs_capacity_penalty: float = 10.0,
+    hgs_adaptive_penalty: bool = False,
+    hgs_target_feasible: float = 0.8,
+    hgs_deep_rounds: int = 1,
+    hgs_deep_route_pair_prune: bool = False,
+    hgs_deep_route_pair_top_k: int = 3,
     elite_k: int = 8,
     elite_min_diversity: float = 0.15,
     elite_cost_tolerance: float = 1.05,
     source_count: int = 2,
     elite_source_period: int = 1,
     pin_global_best_elite: bool = False,
-    gfacs_model=None,
-    gfacs_k_sparse: int | None = None,
-    gfacs_device: str = "cpu",
-    gfacs_prior_scale: float = 1.0,
-    gfacs_prior_center: bool = False,
+    deepaco_model=None,
+    deepaco_k_sparse: int | None = None,
+    deepaco_device: str = "cpu",
+    deepaco_prior_scale: float = 1.0,
+    deepaco_prior_center: bool = False,
     ppo_model=None,
     ppo_device: str = "cpu",
     ppo_edge_feature_mode: str = "full",
@@ -374,11 +388,21 @@ def infer_instance(
         granular_mode=granular_mode,
         granular_wait_weight=granular_wait_weight,
         granular_time_warp_weight=granular_time_warp_weight,
+        hgs_soft_deep_ls=hgs_soft_deep_ls,
+        hgs_soft_cheap_ls=hgs_soft_cheap_ls,
+        hgs_soft_intra_ls=hgs_soft_intra_ls,
+        hgs_deep_ls=hgs_deep_ls,
+        hgs_deep_top_k=hgs_deep_top_k,
+        hgs_tw_penalty=hgs_tw_penalty,
+        hgs_capacity_penalty=hgs_capacity_penalty,
+        hgs_adaptive_penalty=hgs_adaptive_penalty,
+        hgs_target_feasible=hgs_target_feasible,
+        hgs_deep_rounds=hgs_deep_rounds,
+        hgs_deep_route_pair_prune=hgs_deep_route_pair_prune,
+        hgs_deep_route_pair_top_k=hgs_deep_route_pair_top_k,
     )
     solver.seed_rng(seed)
 
-    mini_H = max(1, int(mini_H))
-    total_iter = n_iter * mini_H
     log_steps = list(range(log_period, n_iter + 1, log_period))
     if not log_steps or log_steps[-1] != n_iter:
         log_steps.append(n_iter)
@@ -394,14 +418,14 @@ def infer_instance(
         distances = torch.cdist(positions_tensor, positions_tensor)
     gfacs_prior_instance = build_instance_for_prior(demands, distances, windows)
     ppo_prior_instance = build_ppo_instance_for_prior(demands, positions, windows)
-    static_prior = gfacs_prior(
-        gfacs_model,
+    static_prior = deepaco_prior(
+        deepaco_model,
         gfacs_prior_instance,
         solver,
-        k_sparse=gfacs_k_sparse if gfacs_k_sparse is not None else cand_list_size,
-        device=gfacs_device,
-        prior_scale=gfacs_prior_scale,
-        prior_center=gfacs_prior_center,
+        k_sparse=deepaco_k_sparse if deepaco_k_sparse is not None else cand_list_size,
+        device=deepaco_device,
+        prior_scale=deepaco_prior_scale,
+        prior_center=deepaco_prior_center,
     )
 
     def current_prior():
@@ -424,16 +448,13 @@ def infer_instance(
     start = time.time()
     log_group_idx = 0
     iter_prior = current_prior() if ppo_model is not None and ppo_prior_refresh == "outer" else static_prior
-    for t in range(total_iter):
-        outer_step = (t // mini_H) + 1
-        inner_step = (t % mini_H) + 1
-        is_log_step = inner_step == mini_H and outer_step in log_step_set
-        is_group_start = inner_step == 1 and (outer_step - 1) % log_period == 0
-        if is_group_start:
+    for step in range(1, n_iter + 1):
+        is_log_step = step in log_step_set
+        if (step - 1) % log_period == 0:
             iter_prior = current_prior() if ppo_model is not None and ppo_prior_refresh == "outer" else static_prior
         iter_prior_fn = current_prior if ppo_model is not None and ppo_prior_refresh == "sample" else None
 
-        if is_log_step and elite_source_period > 0 and outer_step % elite_source_period == 0 and len(elite_archive) > 1:
+        if is_log_step and elite_source_period > 0 and step % elite_source_period == 0 and len(elite_archive) > 1:
             costs_np, routes = sample_multisource(
                 solver,
                 elite_archive,
@@ -442,7 +463,7 @@ def infer_instance(
                 prior=iter_prior,
             )
         else:
-            if is_log_step and elite_source_period > 0 and outer_step % elite_source_period == 0:
+            if is_log_step and elite_source_period > 0 and step % elite_source_period == 0:
                 elite_source = select_elite_source(elite_archive, log_group_idx)
                 if elite_source is not None:
                     solver.set_source_route(elite_source["route"], elite_source["cost"])
@@ -478,20 +499,22 @@ def infer_instance(
             log_idx += 1
             log_group_idx += 1
     elapsed = time.time() - start
-    return results, diversities, elapsed, log_steps
+    timings = solver.get_timings() if hasattr(solver, "get_timings") else {}
+    return results, diversities, elapsed, log_steps, timings
 
 
-def test(dataset, n_ants: int, n_iter: int, log_period: int, threads: int | None, seed: int, mini_H: int = 1, **solver_kwargs):
+def test(dataset, n_ants: int, n_iter: int, log_period: int, threads: int | None, seed: int, **solver_kwargs):
     log_steps = list(range(log_period, n_iter + 1, log_period))
     if not log_steps or log_steps[-1] != n_iter:
         log_steps.append(n_iter)
     sum_results = torch.zeros(size=(len(log_steps),), dtype=torch.float32)
     sum_diversities = torch.zeros(size=(len(log_steps),), dtype=torch.float32)
     sum_times = 0.0
+    timing_sums: dict[str, float] = {}
 
     for idx, item in enumerate(tqdm(dataset, dynamic_ncols=True)):
         demands, distances, positions, windows, cost_evaluator = normalize_dataset_item(item)
-        results, diversities, elapsed_time, instance_log_steps = infer_instance(
+        results, diversities, elapsed_time, instance_log_steps, timings = infer_instance(
             demands=demands.cpu(),
             distances=distances.cpu(),
             positions=positions.cpu(),
@@ -502,15 +525,17 @@ def test(dataset, n_ants: int, n_iter: int, log_period: int, threads: int | None
             log_period=log_period,
             threads=threads,
             seed=seed + idx,
-            mini_H=mini_H,
             **solver_kwargs,
         )
         sum_results += results
         sum_diversities += diversities
         sum_times += elapsed_time
+        for key, value in timings.items():
+            timing_sums[key] = timing_sums.get(key, 0.0) + float(value)
 
     assert instance_log_steps == log_steps
-    return sum_results / len(dataset), sum_diversities / len(dataset), sum_times / len(dataset), log_steps
+    avg_timings = {key: value / len(dataset) for key, value in timing_sums.items()}
+    return sum_results / len(dataset), sum_diversities / len(dataset), sum_times / len(dataset), log_steps, avg_timings
 
 
 def write_results(
@@ -529,52 +554,103 @@ def write_results(
     avg_cost,
     avg_diversity,
     log_steps: list[int],
-    mini_H: int = 1,
     data_source: str = "gfacs",
     rl4co_phase: str = "test",
     rl4co_file: str | Path | None = None,
     rl4co_seed: int = 1234,
     rl4co_scale: bool = False,
     checkpoint: str | None = None,
-    gfacs_device: str = "cpu",
-    gfacs_prior_scale: float = 1.0,
-    gfacs_prior_center: bool = False,
+    checkpoint_type: str = "none",
+    granular_mode: int = 0,
+    use_local_search: bool = True,
+    extend_ls: bool = False,
+    smooth_mmas: bool = False,
+    hgs_soft_deep_ls: bool = False,
+    hgs_soft_cheap_ls: bool = False,
+    hgs_soft_intra_ls: bool = False,
+    hgs_deep_ls: bool = False,
+    hgs_deep_top_k: int = 0,
+    hgs_tw_penalty: float = 10.0,
+    hgs_capacity_penalty: float = 10.0,
+    hgs_adaptive_penalty: bool = False,
+    hgs_target_feasible: float = 0.8,
+    hgs_deep_rounds: int = 1,
+    hgs_deep_route_pair_prune: bool = False,
+    hgs_deep_route_pair_top_k: int = 3,
+    deepaco_device: str = "cpu",
+    deepaco_prior_scale: float = 1.0,
+    deepaco_prior_center: bool = False,
     ppo_device: str = "cpu",
     ppo_norm_type: str = "batch",
     ppo_edge_feature_mode: str = "full",
     ppo_prior_refresh: str = "outer",
     ppo_prior_scale: float = 1.0,
     ppo_prior_center: bool = False,
+    timings: dict | None = None,
 ):
     result_txt.parent.mkdir(parents=True, exist_ok=True)
     with result_txt.open("w") as f:
-        f.write(f"problem: {problem_name}\n")
-        f.write(f"problem scale: {n_nodes}\n")
-        f.write(f"checkpoint: {checkpoint if checkpoint is not None else 'none'}\n")
-        f.write(f"number of instances: {n_instances}\n")
+        f.write("[Data]\n")
         f.write(f"data_source: {data_source}\n")
+        f.write(f"number of instances: {n_instances}\n")
         if data_source == "rl4co":
             f.write(f"rl4co_phase: {rl4co_phase}\n")
             f.write(f"rl4co_file: {rl4co_file if rl4co_file is not None else 'default/generated'}\n")
             f.write(f"rl4co_seed: {rl4co_seed}\n")
             f.write(f"rl4co_scale: {rl4co_scale}\n")
+
+        f.write("[FACO]\n")
+        f.write(f"problem: {problem_name}\n")
+        f.write(f"problem scale: {n_nodes}\n")
         f.write("device: cpu\n")
-        f.write(f"gfacs_device: {gfacs_device}\n")
-        f.write(f"gfacs_prior_scale: {gfacs_prior_scale}\n")
-        f.write(f"gfacs_prior_center: {gfacs_prior_center}\n")
-        f.write(f"ppo_device: {ppo_device}\n")
-        f.write(f"ppo_norm_type: {ppo_norm_type}\n")
-        f.write(f"ppo_edge_feature_mode: {ppo_edge_feature_mode}\n")
-        f.write(f"ppo_prior_refresh: {ppo_prior_refresh}\n")
-        f.write(f"ppo_prior_scale: {ppo_prior_scale}\n")
-        f.write(f"ppo_prior_center: {ppo_prior_center}\n")
         f.write(f"n_ants: {n_ants}\n")
+        f.write(f"n_iter: {n_iter}\n")
         f.write(f"log_period: {log_period}\n")
-        f.write(f"mini_H: {mini_H}\n")
         f.write(f"elite_source_period: {elite_source_period}\n")
         f.write(f"threads: {threads if threads is not None else 'default'}\n")
         f.write(f"seed: {seed}\n")
+        f.write(f"granular_mode: {granular_mode}\n")
+        f.write(f"use_local_search: {use_local_search}\n")
+        f.write(f"extend_ls: {extend_ls}\n")
+        f.write(f"smooth_mmas: {smooth_mmas}\n")
+
+        f.write("[HGS / DeepLS]\n")
+        f.write(f"hgs_soft_deep_ls: {hgs_soft_deep_ls}\n")
+        f.write(f"hgs_soft_cheap_ls: {hgs_soft_cheap_ls}\n")
+        f.write(f"hgs_soft_intra_ls: {hgs_soft_intra_ls}\n")
+        f.write(f"hgs_deep_ls: {hgs_deep_ls}\n")
+        f.write(f"hgs_deep_top_k: {hgs_deep_top_k}\n")
+        f.write(f"hgs_tw_penalty: {hgs_tw_penalty}\n")
+        f.write(f"hgs_capacity_penalty: {hgs_capacity_penalty}\n")
+        f.write(f"hgs_adaptive_penalty: {hgs_adaptive_penalty}\n")
+        f.write(f"hgs_target_feasible: {hgs_target_feasible}\n")
+        f.write(f"hgs_deep_rounds: {hgs_deep_rounds}\n")
+        f.write(f"hgs_deep_route_pair_prune: {hgs_deep_route_pair_prune}\n")
+        f.write(f"hgs_deep_route_pair_top_k: {hgs_deep_route_pair_top_k}\n")
+
+        if checkpoint_type == "deepaco":
+            f.write("[DeepACO Prior]\n")
+            f.write(f"checkpoint: {checkpoint}\n")
+            f.write(f"deepaco_device: {deepaco_device}\n")
+            f.write(f"deepaco_prior_scale: {deepaco_prior_scale}\n")
+            f.write(f"deepaco_prior_center: {deepaco_prior_center}\n")
+        elif checkpoint_type == "ppo":
+            f.write("[PPO Prior]\n")
+            f.write(f"checkpoint: {checkpoint}\n")
+            f.write(f"ppo_device: {ppo_device}\n")
+            f.write(f"ppo_norm_type: {ppo_norm_type}\n")
+            f.write(f"ppo_edge_feature_mode: {ppo_edge_feature_mode}\n")
+            f.write(f"ppo_prior_refresh: {ppo_prior_refresh}\n")
+            f.write(f"ppo_prior_scale: {ppo_prior_scale}\n")
+            f.write(f"ppo_prior_center: {ppo_prior_center}\n")
+        else:
+            f.write("[Prior]\n")
+            f.write("checkpoint: none\n")
+
         f.write(f"average inference time: {duration}\n")
+        if timings:
+            for key in sorted(timings):
+                f.write(f"{key}: {timings[key]}\n")
         for i, _step in enumerate(log_steps):
             f.write(f"T={i + 1}, avg. cost {avg_cost[i]}, avg. diversity {avg_diversity[i]}\n")
 
@@ -591,7 +667,6 @@ def main(
     size: int | None = None,
     n_ants: int = 100,
     n_iter: int = 10,
-    mini_H: int = 1,
     log_period: int = 1,
     elite_source_period: int = 1,
     threads: int | None = None,
@@ -622,11 +697,27 @@ def main(
     granular_mode: int = 0,
     granular_wait_weight: float = 0.2,
     granular_time_warp_weight: float = 1.0,
+    hgs_soft_deep_ls: bool = False,
+    hgs_soft_cheap_ls: bool = False,
+    hgs_soft_intra_ls: bool = False,
+    hgs_deep_ls: bool = False,
+    hgs_deep_top_k: int = 0,
+    hgs_tw_penalty: float = 10.0,
+    hgs_capacity_penalty: float = 10.0,
+    hgs_adaptive_penalty: bool = False,
+    hgs_target_feasible: float = 0.8,
+    hgs_deep_rounds: int = 1,
+    hgs_deep_route_pair_prune: bool = False,
+    hgs_deep_route_pair_top_k: int = 3,
     elite_k: int = 8,
     elite_min_diversity: float = 0.15,
     elite_cost_tolerance: float = 1.05,
     source_count: int = 2,
     pin_global_best_elite: bool = False,
+    deepaco_pretrained: str | Path | None = None,
+    deepaco_device: str | None = None,
+    deepaco_prior_scale: float = 1.0,
+    deepaco_prior_center: bool = False,
     gfacs_pretrained: str | Path | None = None,
     gfacs_device: str | None = None,
     gfacs_prior_scale: float = 1.0,
@@ -649,15 +740,30 @@ def main(
         raise ValueError("threads must be >= 1")
     if threads is not None:
         set_faco_cpp_threads(threads)
-    if gfacs_pretrained is not None and ppo_pretrained is not None:
-        raise ValueError("gfacs_pretrained and ppo_pretrained cannot be used together")
+    prior_flags = [
+        name
+        for name, value in (
+            ("deepaco_pretrained", deepaco_pretrained),
+            ("gfacs_pretrained", gfacs_pretrained),
+            ("ppo_pretrained", ppo_pretrained),
+        )
+        if value is not None
+    ]
+    if len(prior_flags) > 1:
+        raise ValueError("Only one prior checkpoint can be used at a time: " + ", ".join(prior_flags))
+    if gfacs_pretrained is not None:
+        deepaco_pretrained = gfacs_pretrained
+        if deepaco_device is None:
+            deepaco_device = gfacs_device
+        deepaco_prior_scale = gfacs_prior_scale
+        deepaco_prior_center = gfacs_prior_center
 
     if k_sparse is None:
         k_sparse = n_nodes // 5
     if cand_list_size is None:
         cand_list_size = min(n_nodes // 5, 32)
-    if gfacs_device is None:
-        gfacs_device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    if deepaco_device is None:
+        deepaco_device = "cuda:0" if torch.cuda.is_available() else "cpu"
     if ppo_device is None:
         ppo_device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
@@ -683,44 +789,80 @@ def main(
     else:
         dataset = load_dataset(n_nodes, "cpu", tam=tam, vrptw=vrptw, data_dir=data_dir)
         dataset = dataset[: (size or len(dataset))]
-    gfacs_model = load_gfacs_prior_model(gfacs_pretrained, gfacs_device) if gfacs_pretrained is not None else None
+    deepaco_model = load_deepaco_prior_model(deepaco_pretrained, deepaco_device) if deepaco_pretrained is not None else None
     ppo_model = load_ppo_prior_model(ppo_pretrained, ppo_device, ppo_norm_type) if ppo_pretrained is not None else None
-    checkpoint_label = str(gfacs_pretrained) if gfacs_pretrained is not None else (str(ppo_pretrained) if ppo_pretrained is not None else None)
-    checkpoint_type = "gfacs" if gfacs_pretrained is not None else ("ppo" if ppo_pretrained is not None else "none")
+    checkpoint_label = str(deepaco_pretrained) if deepaco_pretrained is not None else (str(ppo_pretrained) if ppo_pretrained is not None else None)
+    checkpoint_type = "deepaco" if deepaco_pretrained is not None else ("ppo" if ppo_pretrained is not None else "none")
 
     problem_name = f"{'tam-' if tam else ''}{'vrptw' if vrptw else 'cvrptw'}"
-    print("problem:", problem_name)
-    print("problem scale:", n_nodes)
-    print("checkpoint:", checkpoint_label)
-    print("number of instances:", len(dataset))
-    print("data_source:", data_source)
-    if data_source == "rl4co":
-        print("rl4co_phase:", rl4co_phase)
-        print("rl4co_file:", rl4co_file if rl4co_file is not None else "default/generated")
-        print("rl4co_seed:", rl4co_seed)
-        print("rl4co_scale:", rl4co_scale)
-    print("device:", "cpu")
-    print("gfacs_device:", gfacs_device)
-    print("gfacs_prior_scale:", gfacs_prior_scale)
-    print("gfacs_prior_center:", gfacs_prior_center)
-    print("ppo_device:", ppo_device)
-    print("ppo_norm_type:", ppo_norm_type)
-    print("ppo_edge_feature_mode:", ppo_edge_feature_mode)
-    print("ppo_prior_refresh:", ppo_prior_refresh)
-    print("ppo_prior_scale:", ppo_prior_scale)
-    print("ppo_prior_center:", ppo_prior_center)
-    print("n_ants:", n_ants)
-    print("log_period:", log_period)
-    print("elite_source_period:", elite_source_period)
-    print("threads:", threads if threads is not None else "default")
-    print("seed:", seed)
+    def print_block(title: str, items: dict):
+        print(f"[{title}]")
+        for key, value in items.items():
+            print(f"{key}:", value)
 
-    avg_cost, avg_diversity, duration, log_steps = test(
+    data_log = {"data_source": data_source, "number of instances": len(dataset)}
+    if data_source == "rl4co":
+        data_log.update({
+            "rl4co_phase": rl4co_phase,
+            "rl4co_file": rl4co_file if rl4co_file is not None else "default/generated",
+            "rl4co_seed": rl4co_seed,
+            "rl4co_scale": rl4co_scale,
+        })
+    print_block("Data", data_log)
+    print_block("FACO", {
+        "problem": problem_name,
+        "problem scale": n_nodes,
+        "device": "cpu",
+        "n_ants": n_ants,
+        "n_iter": n_iter,
+        "log_period": log_period,
+        "elite_source_period": elite_source_period,
+        "threads": threads if threads is not None else "default",
+        "seed": seed,
+        "granular_mode": granular_mode,
+        "use_local_search": use_local_search,
+        "extend_ls": extend_ls,
+        "smooth_mmas": smooth_mmas,
+    })
+    print_block("HGS / DeepLS", {
+        "hgs_soft_deep_ls": hgs_soft_deep_ls,
+        "hgs_soft_cheap_ls": hgs_soft_cheap_ls,
+        "hgs_soft_intra_ls": hgs_soft_intra_ls,
+        "hgs_deep_ls": hgs_deep_ls,
+        "hgs_deep_top_k": hgs_deep_top_k,
+        "hgs_tw_penalty": hgs_tw_penalty,
+        "hgs_capacity_penalty": hgs_capacity_penalty,
+        "hgs_adaptive_penalty": hgs_adaptive_penalty,
+        "hgs_target_feasible": hgs_target_feasible,
+        "hgs_deep_rounds": hgs_deep_rounds,
+        "hgs_deep_route_pair_prune": hgs_deep_route_pair_prune,
+        "hgs_deep_route_pair_top_k": hgs_deep_route_pair_top_k,
+    })
+    if deepaco_pretrained is not None:
+        print_block("DeepACO Prior", {
+            "checkpoint": checkpoint_label,
+            "deepaco_device": deepaco_device,
+            "deepaco_prior_scale": deepaco_prior_scale,
+            "deepaco_prior_center": deepaco_prior_center,
+        })
+    elif ppo_pretrained is not None:
+        print_block("PPO Prior", {
+            "checkpoint": checkpoint_label,
+            "ppo_device": ppo_device,
+            "ppo_norm_type": ppo_norm_type,
+            "ppo_edge_feature_mode": ppo_edge_feature_mode,
+            "ppo_prior_refresh": ppo_prior_refresh,
+            "ppo_prior_scale": ppo_prior_scale,
+            "ppo_prior_center": ppo_prior_center,
+        })
+    else:
+        print_block("Prior", {"checkpoint": "none"})
+
+    avg_cost, avg_diversity, duration, log_steps, timings = test(
         dataset,
         n_ants=n_ants,
         n_iter=n_iter,
         log_period=log_period,
-        mini_H=mini_H,
         threads=threads,
         seed=seed,
         cand_list_size=cand_list_size,
@@ -739,17 +881,29 @@ def main(
         granular_mode=granular_mode,
         granular_wait_weight=granular_wait_weight,
         granular_time_warp_weight=granular_time_warp_weight,
+        hgs_soft_deep_ls=hgs_soft_deep_ls,
+        hgs_soft_cheap_ls=hgs_soft_cheap_ls,
+        hgs_soft_intra_ls=hgs_soft_intra_ls,
+        hgs_deep_ls=hgs_deep_ls,
+        hgs_deep_top_k=hgs_deep_top_k,
+        hgs_tw_penalty=hgs_tw_penalty,
+        hgs_capacity_penalty=hgs_capacity_penalty,
+        hgs_adaptive_penalty=hgs_adaptive_penalty,
+        hgs_target_feasible=hgs_target_feasible,
+        hgs_deep_rounds=hgs_deep_rounds,
+        hgs_deep_route_pair_prune=hgs_deep_route_pair_prune,
+        hgs_deep_route_pair_top_k=hgs_deep_route_pair_top_k,
         elite_k=elite_k,
         elite_min_diversity=elite_min_diversity,
         elite_cost_tolerance=elite_cost_tolerance,
         source_count=source_count,
         elite_source_period=elite_source_period,
         pin_global_best_elite=pin_global_best_elite,
-        gfacs_model=gfacs_model,
-        gfacs_k_sparse=k_sparse,
-        gfacs_device=gfacs_device,
-        gfacs_prior_scale=gfacs_prior_scale,
-        gfacs_prior_center=gfacs_prior_center,
+        deepaco_model=deepaco_model,
+        deepaco_k_sparse=k_sparse,
+        deepaco_device=deepaco_device,
+        deepaco_prior_scale=deepaco_prior_scale,
+        deepaco_prior_center=deepaco_prior_center,
         ppo_model=ppo_model,
         ppo_device=ppo_device,
         ppo_edge_feature_mode=ppo_edge_feature_mode,
@@ -759,13 +913,16 @@ def main(
     )
 
     print("average inference time: ", duration)
+    if timings:
+        for key in sorted(timings):
+            print(f"{key}: {timings[key]}")
     for i, _step in enumerate(log_steps):
         print(f"T={i + 1}, avg. cost {avg_cost[i]}, avg. diversity {avg_diversity[i]}")
 
     out_dir = Path(output_dir) if output_dir is not None else ROOT_DIR / "pretrained" / "cvrptw" / str(n_nodes) / "faco"
     result_filename = (
         f"test_result_ckpt{checkpoint_type}-{data_source}-{problem_name}{n_nodes}-ninst{size}-"
-        f"nants{n_ants}-niter{n_iter}-miniH{mini_H}-logperiod{log_period}-eliteperiod{elite_source_period}-gmode{granular_mode}-threads{threads if threads is not None else 'default'}-seed{seed}-faco"
+        f"nants{n_ants}-niter{n_iter}-logperiod{log_period}-eliteperiod{elite_source_period}-gmode{granular_mode}-threads{threads if threads is not None else 'default'}-seed{seed}-faco"
     )
     result_txt = out_dir / f"{result_filename}.txt"
     result_csv = out_dir / f"{result_filename}.csv"
@@ -778,7 +935,6 @@ def main(
         n_ants=n_ants,
         n_iter=n_iter,
         log_period=log_period,
-        mini_H=mini_H,
         elite_source_period=elite_source_period,
         threads=threads,
         seed=seed,
@@ -792,27 +948,41 @@ def main(
         rl4co_seed=rl4co_seed,
         rl4co_scale=rl4co_scale,
         checkpoint=checkpoint_label,
-        gfacs_device=gfacs_device,
-        gfacs_prior_scale=gfacs_prior_scale,
-        gfacs_prior_center=gfacs_prior_center,
+        checkpoint_type=checkpoint_type,
+        granular_mode=granular_mode,
+        use_local_search=use_local_search,
+        extend_ls=extend_ls,
+        smooth_mmas=smooth_mmas,
+        hgs_soft_deep_ls=hgs_soft_deep_ls,
+        hgs_soft_cheap_ls=hgs_soft_cheap_ls,
+        hgs_soft_intra_ls=hgs_soft_intra_ls,
+        hgs_deep_ls=hgs_deep_ls,
+        hgs_deep_top_k=hgs_deep_top_k,
+        hgs_tw_penalty=hgs_tw_penalty,
+        hgs_capacity_penalty=hgs_capacity_penalty,
+        hgs_adaptive_penalty=hgs_adaptive_penalty,
+        hgs_target_feasible=hgs_target_feasible,
+        hgs_deep_rounds=hgs_deep_rounds,
+        hgs_deep_route_pair_prune=hgs_deep_route_pair_prune,
+        hgs_deep_route_pair_top_k=hgs_deep_route_pair_top_k,
+        deepaco_device=deepaco_device,
+        deepaco_prior_scale=deepaco_prior_scale,
+        deepaco_prior_center=deepaco_prior_center,
         ppo_device=ppo_device,
         ppo_norm_type=ppo_norm_type,
         ppo_edge_feature_mode=ppo_edge_feature_mode,
         ppo_prior_refresh=ppo_prior_refresh,
         ppo_prior_scale=ppo_prior_scale,
         ppo_prior_center=ppo_prior_center,
+        timings=timings,
     )
     return avg_cost, avg_diversity, duration, result_txt, result_csv
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Test MFACO_CVRPTW on GFACS-format datasets.")
+    # Data / output
     parser.add_argument("nodes", type=int, help="Problem scale")
-    parser.add_argument("-k", "--k_sparse", type=int, default=None, help="k_sparse / default FACO candidate list size")
-    parser.add_argument("-i", "--n_iter", type=int, default=10, help="Number of FACO iterations")
-    parser.add_argument("--mini_H", type=int, default=1, help="Number of inner FACO samples per logged iteration")
-    parser.add_argument("--threads", type=int, default=None, help="OpenMP thread count for parallel C++ FACO sampling/update")
-    parser.add_argument("-n", "--n_ants", type=int, default=100, help="Number of ants")
     parser.add_argument("-s", "--size", type=int, default=None, help="Number of instances to test")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument("--tam", action="store_true", help="Use TAM dataset")
@@ -826,6 +996,11 @@ def parse_args():
     parser.add_argument("--rl4co_scale", action="store_true", help="Use RL4CO CVRPTW scaled generator")
     parser.add_argument("--output_dir", type=Path, default=None, help="Directory for result txt/csv files")
 
+    # FACO core
+    parser.add_argument("-k", "--k_sparse", type=int, default=None, help="k_sparse / default FACO candidate list size")
+    parser.add_argument("-i", "--n_iter", type=int, default=10, help="Number of FACO iterations")
+    parser.add_argument("--threads", type=int, default=None, help="OpenMP thread count for parallel C++ FACO sampling/update")
+    parser.add_argument("-n", "--n_ants", type=int, default=100, help="Number of ants")
     parser.add_argument("--cand_list_size", type=int, default=None, help="FACO candidate list size; defaults to k_sparse")
     parser.add_argument("--backup_list_size", type=int, default=64, help="FACO backup list size")
     parser.add_argument("--min_new_edges", type=int, default=8, help="FACO min_new_edges")
@@ -842,6 +1017,22 @@ def parse_args():
     parser.add_argument("--granular_mode", type=int, default=0, choices=[0, 1], help="FACO KNN mode: 0 euclidean, 1 spatio-temporal")
     parser.add_argument("--granular_wait_weight", type=float, default=0.2, help="Weight for minimum wait time in granular KNN")
     parser.add_argument("--granular_time_warp_weight", type=float, default=1.0, help="Weight for minimum time warp in granular KNN")
+
+    # HGS / DeepLS
+    parser.add_argument("--hgs_soft_deep_ls", action="store_true", help="Enable HGS-style penalized TW/capacity objective in deep LS")
+    parser.add_argument("--hgs_soft_cheap_ls", action="store_true", help="Enable HGS-style penalized TW/capacity objective in cheap inter-route LS")
+    parser.add_argument("--hgs_soft_intra_ls", action="store_true", help="Enable HGS-style penalized TW/capacity objective in intra-route LS")
+    parser.add_argument("--hgs_deep_ls", action="store_true", help="Enable selective RELOCATE*/SWAP* deep local search")
+    parser.add_argument("--hgs_deep_top_k", type=int, default=0, help="Run HGS deep LS post-sample only on top-k ants; 0 runs inline on every ant")
+    parser.add_argument("--hgs_tw_penalty", type=float, default=10.0, help="Penalty weight for time-warp violation in HGS-style LS")
+    parser.add_argument("--hgs_capacity_penalty", type=float, default=10.0, help="Penalty weight for capacity violation in HGS-style LS")
+    parser.add_argument("--hgs_adaptive_penalty", action="store_true", help="Adapt HGS penalty weights from deep LS feasibility feedback")
+    parser.add_argument("--hgs_target_feasible", type=float, default=0.8, help="Target feasible ratio for adaptive HGS penalty updates")
+    parser.add_argument("--hgs_deep_rounds", type=int, default=1, help="Max accepted deep LS moves per LS call")
+    parser.add_argument("--hgs_deep_route_pair_prune", action="store_true", help="Prune DeepLS route pairs by granular route overlap")
+    parser.add_argument("--hgs_deep_route_pair_top_k", type=int, default=3, help="Max target routes kept per source route for DeepLS route-pair pruning")
+
+    # Elite source management
     parser.add_argument("--elite_k", type=int, default=8, help="Number of quality-diverse elite source routes")
     parser.add_argument("--elite_min_diversity", type=float, default=0.15, help="Minimum edge distance between elite source routes")
     parser.add_argument("--elite_cost_tolerance", type=float, default=1.05, help="Maximum elite source cost ratio versus current best")
@@ -849,10 +1040,18 @@ def parse_args():
     parser.add_argument("--elite_source_period", type=int, default=1, help="Use an elite source every N iterations; 0 disables periodic elite source")
     parser.add_argument("--log_period", type=int, default=1, help="Record cost/diversity every N iterations")
     parser.add_argument("--pin_global_best_elite", action="store_true", help="Always keep global best as one elite archive route")
-    parser.add_argument("--gfacs_pretrained", type=Path, default=None, help="Path to GFACS checkpoint used to generate sampling prior")
-    parser.add_argument("--gfacs_device", type=str, default=None, help="Device for GFACS prior computation; defaults to cuda:0 if available else cpu")
-    parser.add_argument("--gfacs_prior_scale", type=float, default=1.0, help="Multiplier applied to GFACS prior logits before sampling")
-    parser.add_argument("--gfacs_prior_center", action="store_true", help="Row-center GFACS prior logits before scaling")
+
+    # DeepACO prior
+    parser.add_argument("--deepaco_pretrained", type=Path, default=None, help="Path to deepaco_trainer.py checkpoint used to generate sampling prior")
+    parser.add_argument("--deepaco_device", type=str, default=None, help="Device for DeepACO prior computation; defaults to cuda:0 if available else cpu")
+    parser.add_argument("--deepaco_prior_scale", type=float, default=1.0, help="Multiplier applied to DeepACO prior logits before sampling")
+    parser.add_argument("--deepaco_prior_center", action="store_true", help="Row-center DeepACO prior logits before scaling")
+    parser.add_argument("--gfacs_pretrained", type=Path, default=None, help="Deprecated alias for --deepaco_pretrained")
+    parser.add_argument("--gfacs_device", type=str, default=None, help="Deprecated alias for --deepaco_device")
+    parser.add_argument("--gfacs_prior_scale", type=float, default=1.0, help="Deprecated alias for --deepaco_prior_scale")
+    parser.add_argument("--gfacs_prior_center", action="store_true", help="Deprecated alias for --deepaco_prior_center")
+
+    # PPO prior
     parser.add_argument("--ppo_pretrained", type=Path, default=None, help="Path to train_dynaco_ppo.py checkpoint used to generate dynamic sampling prior")
     parser.add_argument("--ppo_device", type=str, default=None, help="Device for PPO prior computation; defaults to cuda:0 if available else cpu")
     parser.add_argument("--ppo_norm_type", type=str, choices=["batch", "layer"], default="batch", help="PPO Net normalization type used by checkpoint")
@@ -871,7 +1070,6 @@ if __name__ == "__main__":
         size=args.size,
         n_ants=args.n_ants,
         n_iter=args.n_iter,
-        mini_H=args.mini_H,
         log_period=args.log_period,
         threads=args.threads,
         seed=args.seed,
@@ -901,12 +1099,28 @@ if __name__ == "__main__":
         granular_mode=args.granular_mode,
         granular_wait_weight=args.granular_wait_weight,
         granular_time_warp_weight=args.granular_time_warp_weight,
+        hgs_soft_deep_ls=args.hgs_soft_deep_ls,
+        hgs_soft_cheap_ls=args.hgs_soft_cheap_ls,
+        hgs_soft_intra_ls=args.hgs_soft_intra_ls,
+        hgs_deep_ls=args.hgs_deep_ls,
+        hgs_deep_top_k=args.hgs_deep_top_k,
+        hgs_tw_penalty=args.hgs_tw_penalty,
+        hgs_capacity_penalty=args.hgs_capacity_penalty,
+        hgs_adaptive_penalty=args.hgs_adaptive_penalty,
+        hgs_target_feasible=args.hgs_target_feasible,
+        hgs_deep_rounds=args.hgs_deep_rounds,
+        hgs_deep_route_pair_prune=args.hgs_deep_route_pair_prune,
+        hgs_deep_route_pair_top_k=args.hgs_deep_route_pair_top_k,
         elite_k=args.elite_k,
         elite_min_diversity=args.elite_min_diversity,
         elite_cost_tolerance=args.elite_cost_tolerance,
         source_count=args.source_count,
         elite_source_period=args.elite_source_period,
         pin_global_best_elite=args.pin_global_best_elite,
+        deepaco_pretrained=args.deepaco_pretrained,
+        deepaco_device=args.deepaco_device,
+        deepaco_prior_scale=args.deepaco_prior_scale,
+        deepaco_prior_center=args.deepaco_prior_center,
         gfacs_pretrained=args.gfacs_pretrained,
         gfacs_device=args.gfacs_device,
         gfacs_prior_scale=args.gfacs_prior_scale,

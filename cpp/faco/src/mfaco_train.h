@@ -219,6 +219,20 @@ public:
   bool use_swap;
   bool use_2opt_star;
   bool use_fts_checks;
+  bool hgs_soft_deep_ls = false;
+  bool hgs_soft_cheap_ls = false;
+  bool hgs_soft_intra_ls = false;
+  bool hgs_deep_ls = false;
+  int32_t hgs_deep_top_k = 0;
+  float hgs_tw_penalty = 10.0f;
+  float hgs_capacity_penalty = 10.0f;
+  bool hgs_adaptive_penalty = false;
+  float hgs_target_feasible = 0.8f;
+  float hgs_tw_penalty_current = 10.0f;
+  float hgs_capacity_penalty_current = 10.0f;
+  int32_t hgs_deep_rounds = 1;
+  bool hgs_deep_route_pair_prune = false;
+  int32_t hgs_deep_route_pair_top_k = 3;
   int32_t granular_mode = 0; // 0 euclidean, 1 static spatio-temporal
   float granular_wait_weight = 0.2f;
   float granular_time_warp_weight = 1.0f;
@@ -260,6 +274,12 @@ public:
   double time_ant = 0.0;
   double time_ls = 0.0;
   double time_split = 0.0;
+  double time_inter_ls = 0.0;
+  double time_intra_ls = 0.0;
+  double time_deep_ls = 0.0;
+  int64_t count_inter_ls = 0;
+  int64_t count_intra_ls = 0;
+  int64_t count_deep_ls = 0;
   mutable int64_t fts_checks = 0;
   mutable int64_t fts_fallback_scans = 0;
 
@@ -357,7 +377,7 @@ private:
                           std::vector<int32_t> &route_out,
                           int32_t &new_edges_out,
                           std::vector<int32_t> &checklist, Xoshiro128Plus &rng,
-                          const float *prior);
+                          const float *prior, bool &final_ls_feasible_out);
 
   float sample_ant_direct_traced(const float *probmat, int32_t start_node,
                                  std::vector<int32_t> &route_out,
@@ -366,7 +386,8 @@ private:
                                  std::vector<int32_t> &checklist,
                                  MFACOTrace &trace, Xoshiro128Plus &rng,
                                  float &logp_sum, float &survival_out,
-                                 const float *prior);
+                                 const float *prior,
+                                 bool &final_ls_feasible_out);
 
   float intra_route_ls(std::vector<int32_t> &route,
                        std::vector<int32_t> &checklist);
@@ -378,6 +399,9 @@ private:
                                  std::vector<int32_t> &positions,
                                  std::vector<int32_t> &checklist,
                                  std::vector<uint8_t> &in_checklist);
+
+  float hgs_deep_local_search(std::vector<int32_t> &route,
+                              std::vector<int32_t> &checklist);
 
   std::tuple<int32_t, bool, float>
   select_next_node(int32_t curr, const float *probmat_row,

@@ -48,6 +48,8 @@ MFACO_CVRP::MFACO_CVRP(const float *coords_ptr, const float *demand_ptr,
   if (capacity <= 0)
     throw std::runtime_error("capacity must be > 0");
   capacity_int = (int64_t)std::round(capacity * DEMAND_SCALE);
+  hgs_tw_penalty_current = hgs_tw_penalty;
+  hgs_capacity_penalty_current = hgs_capacity_penalty;
 
   coords.resize(static_cast<size_t>(n) * 2);
   std::memcpy(coords.data(), coords_ptr,
@@ -351,6 +353,12 @@ void MFACO_CVRP::reset_timings() {
   time_ant = 0.0;
   time_ls = 0.0;
   time_split = 0.0;
+  time_inter_ls = 0.0;
+  time_intra_ls = 0.0;
+  time_deep_ls = 0.0;
+  count_inter_ls = 0;
+  count_intra_ls = 0;
+  count_deep_ls = 0;
   fts_checks = 0;
   fts_fallback_scans = 0;
 }
@@ -803,6 +811,7 @@ void MFACO_CVRP::sample(bool require_prob, const float *prior_ptr,
   };
 
   auto ant_start_time = std::chrono::high_resolution_clock::now();
+  std::vector<uint8_t> hgs_ls_feasible((size_t)n_ants, 1);
 
   if (require_prob) {
     ensure_ant_seeds();
@@ -825,10 +834,12 @@ void MFACO_CVRP::sample(bool require_prob, const float *prior_ptr,
         int32_t mne_out = 0;
 
         float surv_out = 0.0f;
+        bool final_ls_feasible = true;
         (void)sample_ant_direct_traced(
             probmat.data(), start_nodes[a], result.routes[a], result.routes_raw[a],
             result.costs_raw[a], mne_out, checklist, trace, rng_local, logp_sum,
-            surv_out, prior_ptr);
+            surv_out, prior_ptr, final_ls_feasible);
+        hgs_ls_feasible[(size_t)a] = final_ls_feasible ? 1 : 0;
         result.new_edges_count[a] = mne_out;
         result.edge_survival[a] = surv_out;
         result.logps[a] = logp_sum;
@@ -881,10 +892,13 @@ void MFACO_CVRP::sample(bool require_prob, const float *prior_ptr,
           int32_t mne_out = 0;
 
           float surv_out = 0.0f;
+          bool final_ls_feasible = true;
           (void)sample_ant_direct_traced(
               probmat.data(), start_nodes[a], result.routes[a],
               result.routes_raw[a], result.costs_raw[a], mne_out, checklist,
-              trace, rng_local, logp_sum, surv_out, prior_ptr);
+              trace, rng_local, logp_sum, surv_out, prior_ptr,
+              final_ls_feasible);
+          hgs_ls_feasible[(size_t)a] = final_ls_feasible ? 1 : 0;
           result.new_edges_count[a] = mne_out;
           result.edge_survival[a] = surv_out;
           result.logps[a] = logp_sum;
@@ -958,9 +972,12 @@ void MFACO_CVRP::sample(bool require_prob, const float *prior_ptr,
         // Write whatever the sampler returns into routes[a] first. Some
         // sampler variants return only a customer permutation (no depot zeros).
         // We handle both and ensure we end with a depot-separated route.
+        bool final_ls_feasible = true;
         (void)sample_ant_direct(probmat.data(), start_nodes[a],
                                 result.routes[a], result.new_edges_count[a],
-                                checklist, rng_local, prior_ptr);
+                                checklist, rng_local, prior_ptr,
+                                final_ls_feasible);
+        hgs_ls_feasible[(size_t)a] = final_ls_feasible ? 1 : 0;
 
         // Ensure canonical start/end depot.
         if (result.routes[a].empty() || result.routes[a].front() != 0)
@@ -976,6 +993,71 @@ void MFACO_CVRP::sample(bool require_prob, const float *prior_ptr,
       }
     }
   }
+
+  auto update_adaptive_penalty = [&]() {
+    if (!hgs_adaptive_penalty || n_ants <= 0)
+      return;
+    int32_t feasible_count = 0;
+    for (uint8_t feasible : hgs_ls_feasible) {
+      feasible_count += feasible ? 1 : 0;
+    }
+    float feasible_ratio = (float)feasible_count / (float)n_ants;
+    if (feasible_ratio < hgs_target_feasible) {
+      hgs_tw_penalty_current = std::min(hgs_tw_penalty_current * 1.2f, 1e6f);
+      hgs_capacity_penalty_current = std::min(hgs_capacity_penalty_current * 1.2f, 1e6f);
+    } else if (feasible_ratio > hgs_target_feasible + 0.1f) {
+      hgs_tw_penalty_current = std::max(hgs_tw_penalty_current * 0.85f, 1e-3f);
+      hgs_capacity_penalty_current = std::max(hgs_capacity_penalty_current * 0.85f, 1e-3f);
+    }
+  };
+
+  auto run_selective_deep_ls = [&]() {
+    if (require_prob || !hgs_deep_ls || hgs_deep_top_k <= 0 || n_ants <= 0)
+      return;
+    int32_t top_k = std::min(hgs_deep_top_k, n_ants);
+    std::vector<int32_t> order(n_ants);
+    std::iota(order.begin(), order.end(), 0);
+    std::partial_sort(order.begin(), order.begin() + top_k, order.end(),
+                      [&](int32_t a, int32_t b) {
+                        return result.costs[a] < result.costs[b];
+                      });
+    for (int32_t rank = 0; rank < top_k; ++rank) {
+      int32_t a = order[rank];
+      std::vector<int32_t> route_before = result.routes[a];
+      std::vector<int32_t> checklist;
+      checklist.reserve(m);
+      std::vector<uint8_t> seen(n, 0);
+      for (int32_t node : result.routes[a]) {
+        if (node > 0 && node < n && !seen[node]) {
+          checklist.push_back(node);
+          seen[node] = 1;
+        }
+      }
+      auto deep_start = std::chrono::high_resolution_clock::now();
+      hgs_deep_local_search(result.routes[a], checklist);
+      auto deep_end = std::chrono::high_resolution_clock::now();
+      double deep_elapsed = std::chrono::duration<double>(deep_end - deep_start).count();
+#pragma omp atomic
+      time_deep_ls += deep_elapsed;
+#pragma omp atomic
+      count_deep_ls++;
+      if (has_time_windows && !route_fully_feasible(result.routes[a])) {
+        hgs_ls_feasible[(size_t)a] = 0;
+        result.routes[a].swap(route_before);
+      } else {
+        hgs_ls_feasible[(size_t)a] = 1;
+        result.decoded_routes[a] = result.routes[a];
+        result.costs[a] = route_cost_euclid(result.routes[a]);
+      }
+    }
+  };
+
+  auto ls_start_time = std::chrono::high_resolution_clock::now();
+  run_selective_deep_ls();
+  update_adaptive_penalty();
+  auto ls_end_time = std::chrono::high_resolution_clock::now();
+  time_ls += std::chrono::duration<double>(ls_end_time - ls_start_time).count();
+
   auto ant_end_time = std::chrono::high_resolution_clock::now();
   time_ant += std::chrono::duration<double>(ant_end_time - ant_start_time).count();
 }
@@ -1167,7 +1249,6 @@ void MFACO_CVRP::routes_to_perm(const std::vector<std::vector<int32_t>> &routes,
 float MFACO_CVRP::intra_route_ls(std::vector<int32_t> &route,
                                  std::vector<int32_t> &checklist) {
   float total_improvement = 0.0f;
-  // Build route structure: identify which route each node belongs to
   std::vector<int32_t> node_route(n, -1);
   std::vector<std::vector<int32_t>> routes;
   std::vector<int32_t> current;
@@ -1218,7 +1299,40 @@ float MFACO_CVRP::intra_route_ls(std::vector<int32_t> &route,
     return true;
   };
 
-  // Build positions within each route
+  auto sequence_penalized_score = [&](const std::vector<int32_t> &seq) -> float {
+    float travel = 0.0f;
+    float tw_violation = 0.0f;
+    int64_t route_load = 0;
+    float route_time = 0.0f;
+    int32_t prev = 0;
+
+    for (int32_t node : seq) {
+      if (node <= 0 || node >= n)
+        return std::numeric_limits<float>::infinity();
+      route_load += demand_int[node];
+      float edge = dist(prev, node);
+      travel += edge;
+      if (has_time_windows) {
+        float arrival = route_time + edge;
+        tw_violation += std::max(arrival - due_time[node], 0.0f);
+        route_time = std::max(arrival, ready_time[node]);
+      }
+      prev = node;
+    }
+
+    float depot_edge = dist(prev, 0);
+    travel += depot_edge;
+    if (has_time_windows)
+      tw_violation += std::max(route_time + depot_edge - due_time[0], 0.0f);
+    float cap_violation = static_cast<float>(std::max<int64_t>(0, route_load - capacity_int)) /
+                          static_cast<float>(DEMAND_SCALE);
+    float cap_penalty = hgs_adaptive_penalty ? hgs_capacity_penalty_current
+                                             : hgs_capacity_penalty;
+    float tw_penalty = hgs_adaptive_penalty ? hgs_tw_penalty_current
+                                            : hgs_tw_penalty;
+    return travel + cap_penalty * cap_violation + tw_penalty * tw_violation;
+  };
+
   std::vector<int32_t> pos_in_route(n, -1);
   for (size_t r = 0; r < routes.size(); ++r) {
     for (size_t i = 0; i < routes[r].size(); ++i) {
@@ -1226,7 +1340,6 @@ float MFACO_CVRP::intra_route_ls(std::vector<int32_t> &route,
     }
   }
 
-  // Track nodes already in checklist to avoid duplicates
   std::vector<uint8_t> in_checklist_local(n, 0);
   for (int32_t node : checklist) {
     if (node > 0 && node < n) {
@@ -1234,7 +1347,6 @@ float MFACO_CVRP::intra_route_ls(std::vector<int32_t> &route,
     }
   }
 
-  // Process checklist - focused 2-opt
   size_t checklist_pos = 0;
   while (checklist_pos < checklist.size()) {
     int32_t a = checklist[checklist_pos++];
@@ -1254,62 +1366,59 @@ float MFACO_CVRP::intra_route_ls(std::vector<int32_t> &route,
     if (a_pos < 0)
       continue;
 
-    // Get neighbors of a in the route (including depot endpoints)
     int32_t a_prev = (a_pos > 0) ? seq[a_pos - 1] : 0;
     int32_t a_next = (a_pos < size - 1) ? seq[a_pos + 1] : 0;
 
     float dist_a_prev = dist(a_prev, a);
     float dist_a_next = dist(a, a_next);
+    float before_score = hgs_soft_intra_ls ? sequence_penalized_score(seq) : 0.0f;
 
     float max_diff = 0.0f;
     int32_t best_i = -1, best_j = -1;
 
-    // Check 2-opt moves involving edge (a_prev, a)
+    auto consider_reverse = [&](int32_t i, int32_t j, float distance_diff) {
+      if (i < 0 || j <= i || j > size)
+        return;
+      float gain = distance_diff;
+      if (hgs_soft_intra_ls) {
+        std::vector<int32_t> candidate = seq;
+        std::reverse(candidate.begin() + i, candidate.begin() + j);
+        gain = before_score - sequence_penalized_score(candidate);
+      }
+      if (gain > max_diff) {
+        max_diff = gain;
+        best_i = i;
+        best_j = j;
+      }
+    };
+
     for (int32_t jj = 0; jj < k; ++jj) {
       int32_t b = nn_list[a * k + jj];
       if (b <= 0 || b >= n)
         continue;
       if (node_route[b] != r)
-        continue; // Must be same route
+        continue;
 
       float dist_ab = dist(a, b);
-      if (dist_a_prev <= dist_ab)
-        break; // NN list is sorted
+      if (!hgs_soft_intra_ls && dist_a_prev <= dist_ab)
+        break;
 
       int32_t b_pos = pos_in_route[b];
       if (b_pos < 0 || b_pos == a_pos)
         continue;
 
-      // Get b's predecessor
       int32_t b_prev = (b_pos > 0) ? seq[b_pos - 1] : 0;
-
-      // 2-opt: reverse segment between a and b
-      // Current: ...-a_prev-a-...-b_prev-b-...
-      // New:     ...-a_prev-b_prev-...-a-b-...
       if (b_pos > a_pos) {
-        // Reverse [a, b_prev]
         float d_old = dist_a_prev + dist(b_prev, b);
         float d_new = dist(a_prev, b_prev) + dist_ab;
-        float diff = d_old - d_new;
-        if (diff > max_diff) {
-          max_diff = diff;
-          best_i = a_pos;
-          best_j = b_pos;
-        }
+        consider_reverse(a_pos, b_pos, d_old - d_new);
       } else {
-        // Reverse [b, a_prev]
         float d_old = dist(b_prev, b) + dist_a_prev;
         float d_new = dist(b_prev, a) + dist(b, a_prev);
-        float diff = d_old - d_new;
-        if (diff > max_diff) {
-          max_diff = diff;
-          best_i = b_pos;
-          best_j = a_pos;
-        }
+        consider_reverse(b_pos, a_pos, d_old - d_new);
       }
     }
 
-    // Check 2-opt moves involving edge (a, a_next)
     for (int32_t jj = 0; jj < k; ++jj) {
       int32_t b = nn_list[a * k + jj];
       if (b <= 0 || b >= n)
@@ -1318,7 +1427,7 @@ float MFACO_CVRP::intra_route_ls(std::vector<int32_t> &route,
         continue;
 
       float dist_ab = dist(a, b);
-      if (dist_a_next <= dist_ab)
+      if (!hgs_soft_intra_ls && dist_a_next <= dist_ab)
         break;
 
       int32_t b_pos = pos_in_route[b];
@@ -1326,35 +1435,25 @@ float MFACO_CVRP::intra_route_ls(std::vector<int32_t> &route,
         continue;
 
       int32_t b_next = (b_pos < size - 1) ? seq[b_pos + 1] : 0;
-
       if (b_pos > a_pos) {
-        // Reverse [a_next, b]
         float d_old = dist_a_next + dist(b, b_next);
         float d_new = dist_ab + dist(a_next, b_next);
-        float diff = d_old - d_new;
-        if (diff > max_diff) {
-          max_diff = diff;
-          best_i = a_pos + 1;
-          best_j = b_pos + 1;
-        }
+        consider_reverse(a_pos + 1, b_pos + 1, d_old - d_new);
       }
     }
 
-    // Apply best move if found
     if (max_diff > 1e-6f && best_i >= 0 && best_j > best_i) {
       std::reverse(seq.begin() + best_i, seq.begin() + best_j);
-      if (!sequence_feasible(seq)) {
+      if (!hgs_soft_intra_ls && !sequence_feasible(seq)) {
         std::reverse(seq.begin() + best_i, seq.begin() + best_j);
         continue;
       }
       total_improvement += max_diff;
 
-      // Update positions
       for (int32_t i = best_i; i < best_j; ++i) {
         pos_in_route[seq[i]] = i;
       }
 
-      // Add affected nodes to checklist if extend_ls
       if (extend_ls) {
         for (int32_t i = std::max(0, best_i - 1);
              i < std::min(size, best_j + 1); ++i) {
@@ -1368,7 +1467,6 @@ float MFACO_CVRP::intra_route_ls(std::vector<int32_t> &route,
     }
   }
 
-  // Reconstruct route from modified segments
   std::vector<int32_t> new_route;
   new_route.reserve(route.size());
   for (const auto &seg : routes) {
@@ -1439,6 +1537,56 @@ float MFACO_CVRP::intra_route_oropt(std::vector<int32_t> &route,
     return true;
   };
 
+  auto sequence_penalized_score = [&](const std::vector<int32_t> &seq) -> float {
+    float travel = 0.0f;
+    float tw_violation = 0.0f;
+    int64_t route_load = 0;
+    float route_time = 0.0f;
+    int32_t prev = 0;
+
+    for (int32_t node : seq) {
+      if (node <= 0 || node >= n)
+        return std::numeric_limits<float>::infinity();
+      route_load += demand_int[node];
+      float edge = dist(prev, node);
+      travel += edge;
+      if (has_time_windows) {
+        float arrival = route_time + edge;
+        tw_violation += std::max(arrival - due_time[node], 0.0f);
+        route_time = std::max(arrival, ready_time[node]);
+      }
+      prev = node;
+    }
+
+    float depot_edge = dist(prev, 0);
+    travel += depot_edge;
+    if (has_time_windows)
+      tw_violation += std::max(route_time + depot_edge - due_time[0], 0.0f);
+    float cap_violation = static_cast<float>(std::max<int64_t>(0, route_load - capacity_int)) /
+                          static_cast<float>(DEMAND_SCALE);
+    float cap_penalty = hgs_adaptive_penalty ? hgs_capacity_penalty_current
+                                             : hgs_capacity_penalty;
+    float tw_penalty = hgs_adaptive_penalty ? hgs_tw_penalty_current
+                                            : hgs_tw_penalty;
+    return travel + cap_penalty * cap_violation + tw_penalty * tw_violation;
+  };
+
+  auto moved_segment_sequence = [&](const std::vector<int32_t> &seq,
+                                    int32_t start_pos, int32_t segment_len,
+                                    int32_t insert_pos) {
+    std::vector<int32_t> candidate = seq;
+    std::vector<int32_t> segment(candidate.begin() + start_pos,
+                                 candidate.begin() + start_pos + segment_len);
+    candidate.erase(candidate.begin() + start_pos,
+                    candidate.begin() + start_pos + segment_len);
+    int32_t adjusted_insert_pos = insert_pos;
+    if (insert_pos > start_pos)
+      adjusted_insert_pos -= segment_len;
+    candidate.insert(candidate.begin() + adjusted_insert_pos + 1,
+                     segment.begin(), segment.end());
+    return candidate;
+  };
+
   std::vector<int32_t> pos_in_route(n, -1);
   for (size_t r = 0; r < routes.size(); ++r) {
     for (size_t i = 0; i < routes[r].size(); ++i) {
@@ -1477,6 +1625,7 @@ float MFACO_CVRP::intra_route_oropt(std::vector<int32_t> &route,
     int32_t seg_last = seq[end_pos];
     int32_t prev_seg = (start_pos > 0) ? seq[start_pos - 1] : 0;
     int32_t next_seg = (end_pos < size - 1) ? seq[end_pos + 1] : 0;
+    float before_score = hgs_soft_intra_ls ? sequence_penalized_score(seq) : 0.0f;
 
     float max_diff = 0.0f;
     int32_t best_insert_pos = -1;
@@ -1500,6 +1649,11 @@ float MFACO_CVRP::intra_route_oropt(std::vector<int32_t> &route,
       float d_new = dist(prev_seg, next_seg) + dist(b, seg_first) +
                     dist(seg_last, b_next);
       float diff = d_old - d_new;
+      if (hgs_soft_intra_ls) {
+        std::vector<int32_t> candidate =
+            moved_segment_sequence(seq, start_pos, segment_len, b_pos);
+        diff = before_score - sequence_penalized_score(candidate);
+      }
       if (diff > max_diff) {
         max_diff = diff;
         best_insert_pos = b_pos;
@@ -1518,7 +1672,7 @@ float MFACO_CVRP::intra_route_oropt(std::vector<int32_t> &route,
       seq.insert(seq.begin() + adjusted_insert_pos + 1, segment.begin(),
                  segment.end());
 
-      if (!sequence_feasible(seq)) {
+      if (!hgs_soft_intra_ls && !sequence_feasible(seq)) {
         seq.swap(original_seq);
         continue;
       }
@@ -1616,9 +1770,87 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
     route_loads[route_id] = load;
   };
 
+  struct RoutePenaltyEval {
+    float travel = 0.0f;
+    float capacity_violation = 0.0f;
+    float tw_violation = 0.0f;
+    bool feasible = true;
+  };
+
+  auto evaluate_linked_route = [&](int32_t route_id) {
+    RoutePenaltyEval eval;
+    if (route_id < 0 || route_id >= num_routes) {
+      eval.feasible = false;
+      return eval;
+    }
+
+    int64_t overload = std::max<int64_t>(0, route_loads[route_id] - capacity_int);
+    eval.capacity_violation = static_cast<float>(overload) /
+                              static_cast<float>(DEMAND_SCALE);
+
+    float route_time = 0.0f;
+    int32_t prev = 0;
+    int32_t curr = next_node[n + route_id];
+    int32_t guard = 0;
+    while (curr < n) {
+      if (curr <= 0 || node_route[curr] != route_id || ++guard > n) {
+        eval.feasible = false;
+        eval.tw_violation += 1e6f;
+        return eval;
+      }
+      float edge = dist(prev, curr);
+      eval.travel += edge;
+      if (has_time_windows) {
+        float arrival = route_time + edge;
+        float warp = std::max(arrival - due_time[curr], 0.0f);
+        eval.tw_violation += warp;
+        route_time = std::max(arrival, ready_time[curr]);
+      }
+      prev = curr;
+      curr = next_node[curr];
+    }
+
+    float depot_edge = dist(prev, 0);
+    eval.travel += depot_edge;
+    if (has_time_windows) {
+      eval.tw_violation += std::max(route_time + depot_edge - due_time[0], 0.0f);
+    }
+    eval.feasible = eval.capacity_violation <= 1e-6f && eval.tw_violation <= 1e-6f;
+    return eval;
+  };
+
+  auto route_penalized_score = [&](int32_t route_id) {
+    RoutePenaltyEval eval = evaluate_linked_route(route_id);
+    float cap_penalty = hgs_adaptive_penalty ? hgs_capacity_penalty_current
+                                             : hgs_capacity_penalty;
+    float tw_penalty = hgs_adaptive_penalty ? hgs_tw_penalty_current
+                                            : hgs_tw_penalty;
+    return eval.travel + cap_penalty * eval.capacity_violation +
+           tw_penalty * eval.tw_violation;
+  };
+
+  auto affected_routes_score = [&](int32_t r_a, int32_t r_b) {
+    float score = route_penalized_score(r_a);
+    if (r_b != r_a)
+      score += route_penalized_score(r_b);
+    return score;
+  };
+
   auto affected_routes_feasible = [&](int32_t r_a, int32_t r_b) {
-    return linked_route_feasible(r_a, next_node, node_route, route_loads) &&
-           linked_route_feasible(r_b, next_node, node_route, route_loads);
+    RoutePenaltyEval eval_a = evaluate_linked_route(r_a);
+    if (!eval_a.feasible)
+      return false;
+    if (r_b == r_a)
+      return true;
+    return evaluate_linked_route(r_b).feasible;
+  };
+
+  auto accept_affected_routes = [&](float before_score, int32_t r_a,
+                                    int32_t r_b, float fallback_delta) {
+    if (!hgs_soft_cheap_ls)
+      return fallback_delta < -EPS && affected_routes_feasible(r_a, r_b);
+    float after_score = affected_routes_score(r_a, r_b);
+    return after_score + EPS < before_score;
   };
 
   struct RouteFTSState {
@@ -1801,13 +2033,14 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
 
       // A. Relocate u after v
       if (use_relocate && r_u != r_v) {
-        if (route_loads[r_v] + demand_int[u] <= capacity_int) {
+        if (hgs_soft_cheap_ls || route_loads[r_v] + demand_int[u] <= capacity_int) {
           // Case 1: Insert After v
           int32_t prev_u = prev_node[u];
           float delta = dist(prev_u, next_u) + dist(v, u) + dist(u, next_v) -
                         dist(prev_u, u) - dist(u, next_u) - dist(v, next_v);
 
-          if (delta < -EPS) {
+          if (hgs_soft_cheap_ls || delta < -EPS) {
+            float before_score = hgs_soft_cheap_ls ? affected_routes_score(r_u, r_v) : 0.0f;
             // Unlink u
             next_node[prev_u] = next_u;
             prev_node[next_u] = prev_u;
@@ -1820,10 +2053,7 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
 
             update_route_state(n + r_u, r_u);
             update_route_state(n + r_v, r_v);
-            if (!linked_route_feasible(r_u, next_node, node_route,
-                                       route_loads) ||
-                !linked_route_feasible(r_v, next_node, node_route,
-                                       route_loads)) {
+            if (!accept_affected_routes(before_score, r_u, r_v, delta)) {
               next_node[prev_u] = u;
               prev_node[u] = prev_u;
               next_node[u] = next_u;
@@ -1855,7 +2085,8 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
           float delta2 = dist(prev_u, next_u) + dist(prev_v, u) + dist(u, v) -
                          dist(prev_u, u) - dist(u, next_u) - dist(prev_v, v);
 
-          if (delta2 < -EPS) {
+          if (hgs_soft_cheap_ls || delta2 < -EPS) {
+            float before_score = hgs_soft_cheap_ls ? affected_routes_score(r_u, r_v) : 0.0f;
             // Unlink u
             next_node[prev_u] = next_u;
             prev_node[next_u] = prev_u;
@@ -1868,10 +2099,7 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
 
             update_route_state(n + r_u, r_u);
             update_route_state(n + r_v, r_v);
-            if (!linked_route_feasible(r_u, next_node, node_route,
-                                       route_loads) ||
-                !linked_route_feasible(r_v, next_node, node_route,
-                                       route_loads)) {
+            if (!accept_affected_routes(before_score, r_u, r_v, delta2)) {
               next_node[prev_u] = u;
               prev_node[u] = prev_u;
               next_node[u] = next_u;
@@ -1901,13 +2129,14 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
         int32_t u2 = next_u;
         int32_t next_u2 = next_node[u2];
         int64_t segment_load = demand_int[u] + demand_int[u2];
-        if (route_loads[r_v] + segment_load <= capacity_int) {
+        if (hgs_soft_cheap_ls || route_loads[r_v] + segment_load <= capacity_int) {
           int32_t prev_u = prev_node[u];
           float delta = dist(prev_u, next_u2) + dist(v, u) +
                         dist(u2, next_v) - dist(prev_u, u) -
                         dist(u2, next_u2) - dist(v, next_v);
 
-          if (delta < -EPS) {
+          if (hgs_soft_cheap_ls || delta < -EPS) {
+            float before_score = hgs_soft_cheap_ls ? affected_routes_score(r_u, r_v) : 0.0f;
             next_node[prev_u] = next_u2;
             prev_node[next_u2] = prev_u;
             next_node[v] = u;
@@ -1917,7 +2146,7 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
 
             update_route_state(n + r_u, r_u);
             update_route_state(n + r_v, r_v);
-            if (!affected_routes_feasible(r_u, r_v)) {
+            if (!accept_affected_routes(before_score, r_u, r_v, delta)) {
               next_node[prev_u] = u;
               prev_node[u] = prev_u;
               next_node[u2] = next_u2;
@@ -1947,13 +2176,14 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
         int32_t u2 = next_u;
         int32_t next_u2 = next_node[u2];
         int64_t segment_load = demand_int[u] + demand_int[u2];
-        if (route_loads[r_v] + segment_load <= capacity_int) {
+        if (hgs_soft_cheap_ls || route_loads[r_v] + segment_load <= capacity_int) {
           int32_t prev_u = prev_node[u];
           float delta = dist(prev_u, next_u2) + dist(v, u2) +
                         dist(u, next_v) - dist(prev_u, u) -
                         dist(u2, next_u2) - dist(v, next_v);
 
-          if (delta < -EPS) {
+          if (hgs_soft_cheap_ls || delta < -EPS) {
+            float before_score = hgs_soft_cheap_ls ? affected_routes_score(r_u, r_v) : 0.0f;
             next_node[prev_u] = next_u2;
             prev_node[next_u2] = prev_u;
             next_node[v] = u2;
@@ -1965,7 +2195,7 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
 
             update_route_state(n + r_u, r_u);
             update_route_state(n + r_v, r_v);
-            if (!affected_routes_feasible(r_u, r_v)) {
+            if (!accept_affected_routes(before_score, r_u, r_v, delta)) {
               next_node[prev_u] = u;
               prev_node[u] = prev_u;
               next_node[u] = u2;
@@ -1997,13 +2227,14 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
         int64_t load_u_new = route_loads[r_u] - demand_int[u] + demand_int[v];
         int64_t load_v_new = route_loads[r_v] - demand_int[v] + demand_int[u];
 
-        if (load_u_new <= capacity_int && load_v_new <= capacity_int) {
+        if (hgs_soft_cheap_ls || (load_u_new <= capacity_int && load_v_new <= capacity_int)) {
           int32_t prev_u = prev_node[u];
           int32_t prev_v = prev_node[v];
           float delta = dist(prev_u, v) + dist(v, next_u) + dist(prev_v, u) +
                         dist(u, next_v) - dist(prev_u, u) - dist(u, next_u) -
                         dist(prev_v, v) - dist(v, next_v);
-          if (delta < -EPS) {
+          if (hgs_soft_cheap_ls || delta < -EPS) {
+            float before_score = hgs_soft_cheap_ls ? affected_routes_score(r_u, r_v) : 0.0f;
             int32_t nu = next_node[u], pu = prev_node[u];
             int32_t nv = next_node[v], pv = prev_node[v];
             next_node[pu] = v;
@@ -2017,10 +2248,7 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
 
             update_route_state(n + r_u, r_u);
             update_route_state(n + r_v, r_v);
-            if (!linked_route_feasible(r_u, next_node, node_route,
-                                       route_loads) ||
-                !linked_route_feasible(r_v, next_node, node_route,
-                                       route_loads)) {
+            if (!accept_affected_routes(before_score, r_u, r_v, delta)) {
               next_node[pu] = u;
               prev_node[u] = pu;
               next_node[u] = nu;
@@ -2054,11 +2282,12 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
         int64_t head_v = cum_demand[v];
         int64_t tail_v = route_loads[r_v] - head_v;
 
-        if (head_u + tail_v <= capacity_int &&
-            head_v + tail_u <= capacity_int) {
+        if (hgs_soft_cheap_ls || (head_u + tail_v <= capacity_int &&
+            head_v + tail_u <= capacity_int)) {
           float delta = dist(u, next_v) + dist(v, next_u) - dist(u, next_u) -
                         dist(v, next_v);
-          if (delta < -EPS) {
+          if (hgs_soft_cheap_ls || delta < -EPS) {
+            float before_score = hgs_soft_cheap_ls ? affected_routes_score(r_u, r_v) : 0.0f;
             int32_t nu = next_node[u];
             int32_t nv = next_node[v];
             next_node[u] = nv;
@@ -2068,10 +2297,7 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
 
             update_route_state(n + r_u, r_u);
             update_route_state(n + r_v, r_v);
-            if (!linked_route_feasible(r_u, next_node, node_route,
-                                       route_loads) ||
-                !linked_route_feasible(r_v, next_node, node_route,
-                                       route_loads)) {
+            if (!accept_affected_routes(before_score, r_u, r_v, delta)) {
               next_node[u] = nu;
               prev_node[nu] = u;
               next_node[v] = nv;
@@ -2098,13 +2324,14 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
         int64_t load_u_new = route_loads[r_u] - segment_load + demand_int[v];
         int64_t load_v_new = route_loads[r_v] - demand_int[v] + segment_load;
 
-        if (load_u_new <= capacity_int && load_v_new <= capacity_int) {
+        if (hgs_soft_cheap_ls || (load_u_new <= capacity_int && load_v_new <= capacity_int)) {
           float delta = dist(prev_u, v) + dist(v, next_u2) + dist(prev_v, u) +
                         dist(u2, next_v) - dist(prev_u, u) -
                         dist(u2, next_u2) - dist(prev_v, v) -
                         dist(v, next_v);
 
-          if (delta < -EPS) {
+          if (hgs_soft_cheap_ls || delta < -EPS) {
+            float before_score = hgs_soft_cheap_ls ? affected_routes_score(r_u, r_v) : 0.0f;
             next_node[prev_u] = v;
             prev_node[v] = prev_u;
             next_node[v] = next_u2;
@@ -2116,7 +2343,7 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
 
             update_route_state(n + r_u, r_u);
             update_route_state(n + r_v, r_v);
-            if (!affected_routes_feasible(r_u, r_v)) {
+            if (!accept_affected_routes(before_score, r_u, r_v, delta)) {
               next_node[prev_u] = u;
               prev_node[u] = prev_u;
               next_node[u2] = next_u2;
@@ -2153,13 +2380,14 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
         if (u3 < n) {
           int32_t next_u3 = next_node[u3];
           int64_t segment_load = demand_int[u] + demand_int[u2] + demand_int[u3];
-          if (route_loads[r_v] + segment_load <= capacity_int) {
+          if (hgs_soft_cheap_ls || route_loads[r_v] + segment_load <= capacity_int) {
             int32_t prev_u = prev_node[u];
             float delta = dist(prev_u, next_u3) + dist(v, u) +
                           dist(u3, next_v) - dist(prev_u, u) -
                           dist(u3, next_u3) - dist(v, next_v);
 
-            if (delta < -EPS) {
+            if (hgs_soft_cheap_ls || delta < -EPS) {
+              float before_score = hgs_soft_cheap_ls ? affected_routes_score(r_u, r_v) : 0.0f;
               next_node[prev_u] = next_u3;
               prev_node[next_u3] = prev_u;
               next_node[v] = u;
@@ -2169,7 +2397,7 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
 
               update_route_state(n + r_u, r_u);
               update_route_state(n + r_v, r_v);
-              if (!affected_routes_feasible(r_u, r_v)) {
+              if (!accept_affected_routes(before_score, r_u, r_v, delta)) {
                 next_node[prev_u] = u;
                 prev_node[u] = prev_u;
                 next_node[u3] = next_u3;
@@ -2226,6 +2454,439 @@ float MFACO_CVRP::inter_route_ls_optimized(std::vector<int32_t> &perm,
   return total_improvement;
 }
 
+
+// ============================================================================
+// HGS-style Deep Local Search (selective RELOCATE* / SWAP*)
+// ============================================================================
+
+float MFACO_CVRP::hgs_deep_local_search(std::vector<int32_t> &route,
+                                        std::vector<int32_t> &checklist) {
+  if (!hgs_deep_ls || hgs_deep_rounds <= 0 || route.empty())
+    return 0.0f;
+
+  auto parse_routes = [&]() {
+    std::vector<std::vector<int32_t>> routes;
+    std::vector<int32_t> current;
+    for (int32_t node : route) {
+      if (node == 0) {
+        if (!current.empty()) {
+          routes.push_back(current);
+          current.clear();
+        }
+      } else if (node > 0 && node < n) {
+        current.push_back(node);
+      }
+    }
+    if (!current.empty())
+      routes.push_back(current);
+    return routes;
+  };
+
+  auto route_eval_sequence = [&](auto &&emit_nodes) {
+    float travel = 0.0f;
+    float tw_violation = 0.0f;
+    int64_t load = 0;
+    float route_time = 0.0f;
+    int32_t prev = 0;
+    emit_nodes([&](int32_t node) {
+      load += demand_int[node];
+      float edge = dist(prev, node);
+      travel += edge;
+      if (has_time_windows) {
+        float arrival = route_time + edge;
+        tw_violation += std::max(arrival - due_time[node], 0.0f);
+        route_time = std::max(arrival, ready_time[node]);
+      }
+      prev = node;
+    });
+    float depot_edge = dist(prev, 0);
+    travel += depot_edge;
+    if (has_time_windows)
+      tw_violation += std::max(route_time + depot_edge - due_time[0], 0.0f);
+    float cap_violation = static_cast<float>(std::max<int64_t>(0, load - capacity_int)) /
+                          static_cast<float>(DEMAND_SCALE);
+    float cap_penalty = hgs_soft_deep_ls ? (hgs_adaptive_penalty ? hgs_capacity_penalty_current
+                                                            : hgs_capacity_penalty)
+                                    : 1e6f;
+    float tw_penalty = hgs_soft_deep_ls ? (hgs_adaptive_penalty ? hgs_tw_penalty_current
+                                                           : hgs_tw_penalty)
+                                   : 1e6f;
+    return travel + cap_penalty * cap_violation + tw_penalty * tw_violation;
+  };
+
+  auto route_eval = [&](const std::vector<int32_t> &seq) {
+    return route_eval_sequence([&](auto emit) {
+      for (int32_t node : seq)
+        emit(node);
+    });
+  };
+
+  auto route_eval_remove_insert = [&](const std::vector<int32_t> &seq,
+                                      int32_t remove_pos, int32_t insert_pos,
+                                      int32_t insert_node) {
+    return route_eval_sequence([&](auto emit) {
+      int32_t kept_pos = 0;
+      for (int32_t i = 0; i < (int32_t)seq.size(); ++i) {
+        if (i == remove_pos)
+          continue;
+        if (kept_pos == insert_pos)
+          emit(insert_node);
+        emit(seq[i]);
+        kept_pos++;
+      }
+      if (kept_pos == insert_pos)
+        emit(insert_node);
+    });
+  };
+
+  auto route_eval_insert = [&](const std::vector<int32_t> &seq,
+                               int32_t insert_pos, int32_t insert_node) {
+    return route_eval_sequence([&](auto emit) {
+      for (int32_t i = 0; i <= (int32_t)seq.size(); ++i) {
+        if (i == insert_pos)
+          emit(insert_node);
+        if (i < (int32_t)seq.size())
+          emit(seq[i]);
+      }
+    });
+  };
+
+  auto route_eval_remove = [&](const std::vector<int32_t> &seq,
+                               int32_t remove_pos) {
+    return route_eval_sequence([&](auto emit) {
+      for (int32_t i = 0; i < (int32_t)seq.size(); ++i) {
+        if (i != remove_pos)
+          emit(seq[i]);
+      }
+    });
+  };
+
+
+  auto route_eval_remove_segment = [&](const std::vector<int32_t> &seq,
+                                       int32_t remove_pos,
+                                       int32_t segment_len) {
+    return route_eval_sequence([&](auto emit) {
+      for (int32_t i = 0; i < (int32_t)seq.size(); ++i) {
+        if (i < remove_pos || i >= remove_pos + segment_len)
+          emit(seq[i]);
+      }
+    });
+  };
+
+  auto route_eval_insert_segment = [&](const std::vector<int32_t> &seq,
+                                       int32_t insert_pos,
+                                       const std::vector<int32_t> &segment) {
+    return route_eval_sequence([&](auto emit) {
+      for (int32_t i = 0; i <= (int32_t)seq.size(); ++i) {
+        if (i == insert_pos) {
+          for (int32_t node : segment)
+            emit(node);
+        }
+        if (i < (int32_t)seq.size())
+          emit(seq[i]);
+      }
+    });
+  };
+
+
+  auto route_eval_two_opt_star_u = [&](const std::vector<int32_t> &seq_u,
+                                       int32_t cut_u,
+                                       const std::vector<int32_t> &seq_v,
+                                       int32_t cut_v) {
+    return route_eval_sequence([&](auto emit) {
+      for (int32_t i = 0; i <= cut_u; ++i)
+        emit(seq_u[i]);
+      for (int32_t i = cut_v + 1; i < (int32_t)seq_v.size(); ++i)
+        emit(seq_v[i]);
+    });
+  };
+
+  auto route_eval_two_opt_star_v = [&](const std::vector<int32_t> &seq_u,
+                                       int32_t cut_u,
+                                       const std::vector<int32_t> &seq_v,
+                                       int32_t cut_v) {
+    return route_eval_sequence([&](auto emit) {
+      for (int32_t i = 0; i <= cut_v; ++i)
+        emit(seq_v[i]);
+      for (int32_t i = cut_u + 1; i < (int32_t)seq_u.size(); ++i)
+        emit(seq_u[i]);
+    });
+  };
+
+  auto solution_score = [&](const std::vector<std::vector<int32_t>> &routes) {
+    float score = 0.0f;
+    for (const auto &seq : routes)
+      score += route_eval(seq);
+    return score;
+  };
+
+  std::vector<std::vector<int32_t>> routes = parse_routes();
+  if (routes.size() < 2)
+    return 0.0f;
+
+  std::vector<int32_t> node_route(n, -1), node_pos(n, -1);
+  auto rebuild_index = [&]() {
+    std::fill(node_route.begin(), node_route.end(), -1);
+    std::fill(node_pos.begin(), node_pos.end(), -1);
+    for (int32_t r = 0; r < (int32_t)routes.size(); ++r) {
+      for (int32_t i = 0; i < (int32_t)routes[r].size(); ++i) {
+        node_route[routes[r][i]] = r;
+        node_pos[routes[r][i]] = i;
+      }
+    }
+  };
+
+  auto write_routes = [&]() {
+    route.clear();
+    route.reserve(m + (int32_t)routes.size() + 1);
+    for (const auto &seq : routes) {
+      if (seq.empty())
+        continue;
+      route.push_back(0);
+      for (int32_t node : seq)
+        route.push_back(node);
+    }
+    if (!route.empty() && route.back() != 0)
+      route.push_back(0);
+  };
+
+  auto build_route_pair_allowed = [&]() {
+    const int32_t route_count = (int32_t)routes.size();
+    std::vector<std::vector<uint8_t>> allowed(
+        route_count, std::vector<uint8_t>(route_count, 1));
+    if (!hgs_deep_route_pair_prune || hgs_deep_route_pair_top_k <= 0 ||
+        route_count <= 2)
+      return allowed;
+
+    for (int32_t r = 0; r < route_count; ++r)
+      std::fill(allowed[r].begin(), allowed[r].end(), 0);
+
+    const int32_t top_k = std::min(hgs_deep_route_pair_top_k, route_count - 1);
+    for (int32_t r_u = 0; r_u < route_count; ++r_u) {
+      std::vector<int32_t> best_rank(route_count, k + 1);
+      for (int32_t u : routes[r_u]) {
+        if (u <= 0 || u >= n)
+          continue;
+        for (int32_t jj = 0; jj < k; ++jj) {
+          int32_t v = nn_list[u * k + jj];
+          if (v <= 0 || v >= n)
+            continue;
+          int32_t r_v = node_route[v];
+          if (r_v < 0 || r_v == r_u)
+            continue;
+          if (jj < best_rank[r_v])
+            best_rank[r_v] = jj;
+        }
+      }
+
+      std::vector<std::pair<int32_t, int32_t>> candidates;
+      candidates.reserve(route_count - 1);
+      for (int32_t r_v = 0; r_v < route_count; ++r_v) {
+        if (r_v != r_u && best_rank[r_v] <= k)
+          candidates.emplace_back(best_rank[r_v], r_v);
+      }
+
+      if (candidates.empty()) {
+        for (int32_t r_v = 0; r_v < route_count; ++r_v) {
+          if (r_v != r_u)
+            allowed[r_u][r_v] = 1;
+        }
+        continue;
+      }
+
+      std::sort(candidates.begin(), candidates.end());
+      const int32_t keep = std::min(top_k, (int32_t)candidates.size());
+      for (int32_t idx = 0; idx < keep; ++idx) {
+        int32_t r_v = candidates[idx].second;
+        allowed[r_u][r_v] = 1;
+        allowed[r_v][r_u] = 1;
+      }
+    }
+
+    for (int32_t r_u = 0; r_u < route_count; ++r_u) {
+      bool has_target = false;
+      for (int32_t r_v = 0; r_v < route_count; ++r_v) {
+        if (r_v != r_u && allowed[r_u][r_v]) {
+          has_target = true;
+          break;
+        }
+      }
+      if (!has_target) {
+        for (int32_t r_v = 0; r_v < route_count; ++r_v) {
+          if (r_v != r_u)
+            allowed[r_u][r_v] = 1;
+        }
+      }
+    }
+    return allowed;
+  };
+
+  std::vector<uint8_t> active(n, 0);
+  std::vector<int32_t> active_nodes;
+  for (int32_t node : checklist) {
+    if (node > 0 && node < n && !active[node]) {
+      active[node] = 1;
+      active_nodes.push_back(node);
+    }
+  }
+  if (active_nodes.empty()) {
+    for (int32_t node = 1; node < n; ++node)
+      active_nodes.push_back(node);
+  }
+
+  float total_gain = 0.0f;
+  for (int32_t round = 0; round < hgs_deep_rounds; ++round) {
+    rebuild_index();
+    auto route_pair_allowed = build_route_pair_allowed();
+    float best_gain = EPS;
+    int32_t best_type = 0;
+    int32_t best_u = -1, best_v = -1;
+    int32_t best_insert_u = -1, best_insert_v = -1;
+    int32_t best_segment_len = 1;
+    int32_t best_cut_u = -1, best_cut_v = -1;
+
+    for (int32_t u : active_nodes) {
+      int32_t r_u = node_route[u];
+      int32_t pos_u = node_pos[u];
+      if (r_u < 0 || pos_u < 0)
+        continue;
+
+      for (int32_t jj = 0; jj < k; ++jj) {
+        int32_t v = nn_list[u * k + jj];
+        if (v <= 0 || v >= n)
+          continue;
+        int32_t r_v = node_route[v];
+        int32_t pos_v = node_pos[v];
+        if (r_v < 0 || r_v == r_u || pos_v < 0)
+          continue;
+        if (hgs_deep_route_pair_prune && !route_pair_allowed[r_u][r_v])
+          continue;
+
+        const float before = route_eval(routes[r_u]) + route_eval(routes[r_v]);
+
+        float ru_without_u_score = route_eval_remove(routes[r_u], pos_u);
+        for (int32_t insert_pos = 0; insert_pos <= (int32_t)routes[r_v].size(); ++insert_pos) {
+          float after = ru_without_u_score + route_eval_insert(routes[r_v], insert_pos, u);
+          float gain = before - after;
+          if (gain > best_gain) {
+            best_gain = gain;
+            best_type = 1;
+            best_u = u;
+            best_v = v;
+            best_insert_u = insert_pos;
+            best_insert_v = -1;
+            best_segment_len = 1;
+          }
+        }
+
+        for (int32_t seg_len = 2; seg_len <= 3; ++seg_len) {
+          if (pos_u + seg_len > (int32_t)routes[r_u].size())
+            continue;
+          std::vector<int32_t> segment;
+          segment.reserve(seg_len);
+          for (int32_t sidx = 0; sidx < seg_len; ++sidx)
+            segment.push_back(routes[r_u][pos_u + sidx]);
+          float ru_without_segment_score =
+              route_eval_remove_segment(routes[r_u], pos_u, seg_len);
+          float before_segment = before;
+          for (int32_t insert_pos = 0; insert_pos <= (int32_t)routes[r_v].size(); ++insert_pos) {
+            float after = ru_without_segment_score +
+                          route_eval_insert_segment(routes[r_v], insert_pos, segment);
+            float gain = before_segment - after;
+            if (gain > best_gain) {
+              best_gain = gain;
+              best_type = 3;
+              best_u = u;
+              best_v = v;
+              best_insert_u = insert_pos;
+              best_insert_v = -1;
+              best_segment_len = seg_len;
+            }
+          }
+        }
+
+        for (int32_t insert_v = 0; insert_v <= (int32_t)routes[r_u].size() - 1; ++insert_v) {
+          float ru_score = route_eval_remove_insert(routes[r_u], pos_u, insert_v, v);
+          for (int32_t insert_u = 0; insert_u <= (int32_t)routes[r_v].size() - 1; ++insert_u) {
+            float after = ru_score + route_eval_remove_insert(routes[r_v], pos_v, insert_u, u);
+            float gain = before - after;
+            if (gain > best_gain) {
+              best_gain = gain;
+              best_type = 2;
+              best_u = u;
+              best_v = v;
+              best_insert_u = insert_u;
+              best_insert_v = insert_v;
+              best_segment_len = 1;
+            }
+          }
+        }
+
+
+        if (pos_u + 1 < (int32_t)routes[r_u].size() ||
+            pos_v + 1 < (int32_t)routes[r_v].size()) {
+          float after = route_eval_two_opt_star_u(routes[r_u], pos_u, routes[r_v], pos_v) +
+                        route_eval_two_opt_star_v(routes[r_u], pos_u, routes[r_v], pos_v);
+          float gain = before - after;
+          if (gain > best_gain) {
+            best_gain = gain;
+            best_type = 4;
+            best_u = u;
+            best_v = v;
+            best_cut_u = pos_u;
+            best_cut_v = pos_v;
+            best_segment_len = 1;
+          }
+        }
+      }
+    }
+
+    if (best_type == 0)
+      break;
+
+    rebuild_index();
+    int32_t r_u = node_route[best_u];
+    int32_t r_v = node_route[best_v];
+    int32_t pos_u = node_pos[best_u];
+    int32_t pos_v = node_pos[best_v];
+    if (r_u < 0 || r_v < 0 || r_u == r_v || pos_u < 0 || pos_v < 0)
+      break;
+
+    if (best_type == 1) {
+      routes[r_u].erase(routes[r_u].begin() + pos_u);
+      routes[r_v].insert(routes[r_v].begin() + best_insert_u, best_u);
+    } else if (best_type == 3) {
+      std::vector<int32_t> segment;
+      segment.reserve(best_segment_len);
+      for (int32_t sidx = 0; sidx < best_segment_len; ++sidx)
+        segment.push_back(routes[r_u][pos_u + sidx]);
+      routes[r_u].erase(routes[r_u].begin() + pos_u,
+                        routes[r_u].begin() + pos_u + best_segment_len);
+      routes[r_v].insert(routes[r_v].begin() + best_insert_u,
+                         segment.begin(), segment.end());
+    } else if (best_type == 4) {
+      std::vector<int32_t> tail_u(routes[r_u].begin() + best_cut_u + 1,
+                                  routes[r_u].end());
+      std::vector<int32_t> tail_v(routes[r_v].begin() + best_cut_v + 1,
+                                  routes[r_v].end());
+      routes[r_u].erase(routes[r_u].begin() + best_cut_u + 1, routes[r_u].end());
+      routes[r_v].erase(routes[r_v].begin() + best_cut_v + 1, routes[r_v].end());
+      routes[r_u].insert(routes[r_u].end(), tail_v.begin(), tail_v.end());
+      routes[r_v].insert(routes[r_v].end(), tail_u.begin(), tail_u.end());
+    } else {
+      routes[r_u].erase(routes[r_u].begin() + pos_u);
+      routes[r_v].erase(routes[r_v].begin() + pos_v);
+      routes[r_u].insert(routes[r_u].begin() + best_insert_v, best_v);
+      routes[r_v].insert(routes[r_v].begin() + best_insert_u, best_u);
+    }
+    total_gain += best_gain;
+  }
+
+  if (total_gain > EPS)
+    write_routes();
+  return total_gain;
+}
+
 // MFACO_CVRP::sample_ant_direct / traced (Relocation-Based Sampling)
 // ============================================================================
 
@@ -2233,7 +2894,8 @@ float MFACO_CVRP::sample_ant_direct(const float *probmat, int32_t start_node,
                                     std::vector<int32_t> &route_out,
                                     int32_t &new_edges_out,
                                     std::vector<int32_t> &checklist,
-                                    Xoshiro128Plus &rng, const float *prior) {
+                                    Xoshiro128Plus &rng, const float *prior,
+                                    bool &final_ls_feasible_out) {
   // Relocation-Based Sampling (Phase 1) with Linked List & Split Logic
 
   // 1. Build Adjacency of Source (for new edge detection)
@@ -2548,25 +3210,70 @@ float MFACO_CVRP::sample_ant_direct(const float *probmat, int32_t start_node,
 
   // 6. Apply Local Search
   if (use_local_search && !checklist.empty()) {
-    // Intra-Route Or-opt (1/2/3)
+    // Intra-Route Or-opt (1/2/3) + Intra-Route LS (2-opt)
+    auto intra_start = std::chrono::high_resolution_clock::now();
     intra_route_oropt(route_out, checklist, 1);
     intra_route_oropt(route_out, checklist, 2);
     intra_route_oropt(route_out, checklist, 3);
-    // Intra-Route LS (2-opt)
     intra_route_ls(route_out, checklist);
+    auto intra_end = std::chrono::high_resolution_clock::now();
+    double intra_elapsed = std::chrono::duration<double>(intra_end - intra_start).count();
+#pragma omp atomic
+    time_intra_ls += intra_elapsed;
+#pragma omp atomic
+    count_intra_ls += 4;
     // Inter-Route LS
     std::vector<int32_t> pos_ls(n, -1);
+    std::vector<int32_t> route_before_inter;
+    if (has_time_windows && hgs_soft_cheap_ls)
+      route_before_inter = route_out;
+    auto inter_start = std::chrono::high_resolution_clock::now();
     inter_route_ls_optimized(route_out, pos_ls, checklist, in_checklist);
-    // Intra-Route Or-opt (1/2/3)
+    auto inter_end = std::chrono::high_resolution_clock::now();
+    double inter_elapsed = std::chrono::duration<double>(inter_end - inter_start).count();
+#pragma omp atomic
+    time_inter_ls += inter_elapsed;
+#pragma omp atomic
+    count_inter_ls++;
+    if (has_time_windows && hgs_soft_cheap_ls && !route_fully_feasible(route_out))
+      route_out.swap(route_before_inter);
+    std::vector<int32_t> route_before_intra;
+    if (has_time_windows && hgs_soft_intra_ls)
+      route_before_intra = route_out;
+    // Intra-Route Or-opt (1/2/3) + Intra-Route LS (2-opt)
+    intra_start = std::chrono::high_resolution_clock::now();
     intra_route_oropt(route_out, checklist, 1);
     intra_route_oropt(route_out, checklist, 2);
     intra_route_oropt(route_out, checklist, 3);
-    // Intra-Route LS (2-opt)
     intra_route_ls(route_out, checklist);
+    intra_end = std::chrono::high_resolution_clock::now();
+    intra_elapsed = std::chrono::duration<double>(intra_end - intra_start).count();
+#pragma omp atomic
+    time_intra_ls += intra_elapsed;
+#pragma omp atomic
+    count_intra_ls += 4;
+    if (has_time_windows && hgs_soft_intra_ls && !route_fully_feasible(route_out))
+      route_out.swap(route_before_intra);
+    if (hgs_deep_ls && hgs_deep_top_k <= 0) {
+      std::vector<int32_t> route_before_deep;
+      if (has_time_windows)
+        route_before_deep = route_out;
+      auto deep_start = std::chrono::high_resolution_clock::now();
+      hgs_deep_local_search(route_out, checklist);
+      auto deep_end = std::chrono::high_resolution_clock::now();
+      double deep_elapsed = std::chrono::duration<double>(deep_end - deep_start).count();
+#pragma omp atomic
+      time_deep_ls += deep_elapsed;
+#pragma omp atomic
+      count_deep_ls++;
+      if (has_time_windows && !route_fully_feasible(route_out))
+        route_out.swap(route_before_deep);
+    }
   }
 
   if (has_time_windows && !route_fully_feasible(route_out))
     route_out.swap(route_before_ls);
+  final_ls_feasible_out = !has_time_windows || route_fully_feasible(route_out);
   if (has_time_windows && !route_fully_feasible(route_out)) {
     enforce_time_windows(route_out);
     if (!route_fully_feasible(route_out))
@@ -2982,7 +3689,7 @@ float MFACO_CVRP::sample_ant_direct_traced(
     std::vector<int32_t> &route_raw_out, float &cost_raw_out,
     int32_t &new_edges_out, std::vector<int32_t> &checklist, MFACOTrace &trace,
     Xoshiro128Plus &rng, float &logp_sum, float &survival_out,
-    const float *prior) {
+    const float *prior, bool &final_ls_feasible_out) {
   // Copy-paste from sample_ant_direct, with tracing added
   trace.clear();
   trace.start_node = start_node;
@@ -3329,24 +4036,69 @@ float MFACO_CVRP::sample_ant_direct_traced(
     std::vector<int32_t> route_before_ls;
     if (has_time_windows)
       route_before_ls = route_out;
-    // Intra-Route Or-opt (1/2/3)
+    // Intra-Route Or-opt (1/2/3) + Intra-Route LS (2-opt)
+    auto intra_start = std::chrono::high_resolution_clock::now();
     intra_route_oropt(route_out, checklist, 1);
     intra_route_oropt(route_out, checklist, 2);
     intra_route_oropt(route_out, checklist, 3);
-    // Intra-Route LS (2-opt)
     intra_route_ls(route_out, checklist);
+    auto intra_end = std::chrono::high_resolution_clock::now();
+    double intra_elapsed = std::chrono::duration<double>(intra_end - intra_start).count();
+#pragma omp atomic
+    time_intra_ls += intra_elapsed;
+#pragma omp atomic
+    count_intra_ls += 4;
     // Inter-Route LS
     std::vector<int32_t> pos_ls(n, -1);
+    std::vector<int32_t> route_before_inter;
+    if (has_time_windows && hgs_soft_cheap_ls)
+      route_before_inter = route_out;
+    auto inter_start = std::chrono::high_resolution_clock::now();
     inter_route_ls_optimized(route_out, pos_ls, checklist, in_checklist);
-    // Intra-Route Or-opt (1/2/3)
+    auto inter_end = std::chrono::high_resolution_clock::now();
+    double inter_elapsed = std::chrono::duration<double>(inter_end - inter_start).count();
+#pragma omp atomic
+    time_inter_ls += inter_elapsed;
+#pragma omp atomic
+    count_inter_ls++;
+    if (has_time_windows && hgs_soft_cheap_ls && !route_fully_feasible(route_out))
+      route_out.swap(route_before_inter);
+    std::vector<int32_t> route_before_intra;
+    if (has_time_windows && hgs_soft_intra_ls)
+      route_before_intra = route_out;
+    // Intra-Route Or-opt (1/2/3) + Intra-Route LS (2-opt)
+    intra_start = std::chrono::high_resolution_clock::now();
     intra_route_oropt(route_out, checklist, 1);
     intra_route_oropt(route_out, checklist, 2);
     intra_route_oropt(route_out, checklist, 3);
-    // Intra-Route LS (2-opt)
     intra_route_ls(route_out, checklist);
+    intra_end = std::chrono::high_resolution_clock::now();
+    intra_elapsed = std::chrono::duration<double>(intra_end - intra_start).count();
+#pragma omp atomic
+    time_intra_ls += intra_elapsed;
+#pragma omp atomic
+    count_intra_ls += 4;
+    if (has_time_windows && hgs_soft_intra_ls && !route_fully_feasible(route_out))
+      route_out.swap(route_before_intra);
+    if (hgs_deep_ls && hgs_deep_top_k <= 0) {
+      std::vector<int32_t> route_before_deep;
+      if (has_time_windows)
+        route_before_deep = route_out;
+      auto deep_start = std::chrono::high_resolution_clock::now();
+      hgs_deep_local_search(route_out, checklist);
+      auto deep_end = std::chrono::high_resolution_clock::now();
+      double deep_elapsed = std::chrono::duration<double>(deep_end - deep_start).count();
+#pragma omp atomic
+      time_deep_ls += deep_elapsed;
+#pragma omp atomic
+      count_deep_ls++;
+      if (has_time_windows && !route_fully_feasible(route_out))
+        route_out.swap(route_before_deep);
+    }
     if (has_time_windows && !route_fully_feasible(route_out))
       route_out.swap(route_before_ls);
   }
+  final_ls_feasible_out = !has_time_windows || route_fully_feasible(route_out);
   if (has_time_windows && !route_fully_feasible(route_out)) {
     enforce_time_windows(route_out);
     if (!route_fully_feasible(route_out))

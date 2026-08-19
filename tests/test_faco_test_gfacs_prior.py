@@ -1,4 +1,4 @@
-﻿import numpy as np
+import numpy as np
 import torch
 
 from evaluation import faco_test
@@ -29,13 +29,13 @@ def test_sample_multisource_forwards_prior_to_each_source():
     assert solver.priors == [prior, prior]
 
 
-def test_gfacs_prior_gathers_original_model_matrix_by_solver_candidate_list(monkeypatch):
+def test_deepaco_prior_gathers_model_matrix_by_solver_candidate_list(monkeypatch):
     captured = {}
 
     class FakePygData:
         pass
 
-    class FakeOriginalGFACS(torch.nn.Module):
+    class FakeDeepACO(torch.nn.Module):
         def forward(self, pyg_data):
             assert pyg_data is captured["pyg_data"]
             return torch.arange(9, dtype=torch.float32)
@@ -54,15 +54,15 @@ def test_gfacs_prior_gathers_original_model_matrix_by_solver_candidate_list(monk
     class FakeSolver:
         nn_list = np.array([[2, 1], [0, 2], [1, 0]], dtype=np.int32)
 
-    def fake_gen_original_gfacs_pyg_data(demands, distances, windows, device, k_sparse):
+    def fake_gen_deepaco_pyg_data(demands, distances, windows, device, k_sparse):
         captured["args"] = (demands, distances, windows, device, k_sparse)
         captured["pyg_data"] = FakePygData()
         return captured["pyg_data"]
 
-    monkeypatch.setattr(faco_test, "gen_original_gfacs_pyg_data", fake_gen_original_gfacs_pyg_data)
+    monkeypatch.setattr(faco_test, "gen_deepaco_pyg_data", fake_gen_deepaco_pyg_data)
 
-    prior = faco_test.gfacs_prior(
-        FakeOriginalGFACS(),
+    prior = faco_test.deepaco_prior(
+        FakeDeepACO(),
         {
             "demand": torch.zeros(3),
             "distances": torch.ones((3, 3)),
@@ -82,11 +82,11 @@ def test_gfacs_prior_gathers_original_model_matrix_by_solver_candidate_list(monk
     assert captured["args"][4] == 2
 
 
-def test_gfacs_prior_can_row_center_and_scale(monkeypatch):
+def test_deepaco_prior_can_row_center_and_scale(monkeypatch):
     class FakePygData:
         pass
 
-    class FakeOriginalGFACS(torch.nn.Module):
+    class FakeDeepACO(torch.nn.Module):
         def forward(self, _pyg_data):
             return torch.arange(4, dtype=torch.float32)
 
@@ -97,10 +97,10 @@ def test_gfacs_prior_can_row_center_and_scale(monkeypatch):
     class FakeSolver:
         nn_list = np.array([[0, 1], [0, 1]], dtype=np.int32)
 
-    monkeypatch.setattr(faco_test, "gen_original_gfacs_pyg_data", lambda *_args, **_kwargs: FakePygData())
+    monkeypatch.setattr(faco_test, "gen_deepaco_pyg_data", lambda *_args, **_kwargs: FakePygData())
 
-    prior = faco_test.gfacs_prior(
-        FakeOriginalGFACS(),
+    prior = faco_test.deepaco_prior(
+        FakeDeepACO(),
         {"demand": torch.zeros(2), "distances": torch.ones((2, 2)), "windows": torch.ones((2, 2))},
         solver=FakeSolver(),
         k_sparse=2,
@@ -113,12 +113,13 @@ def test_gfacs_prior_can_row_center_and_scale(monkeypatch):
     assert np.allclose(prior, expected)
 
 
-def test_load_gfacs_prior_model_loads_original_net_checkpoint(tmp_path):
-    model = faco_test.OriginalGFACSNet(gfn=True, Z_out_dim=1)
+def test_load_deepaco_prior_model_loads_deepaco_trainer_checkpoint(tmp_path):
+    model = faco_test.OriginalGFACSNet(gfn=False)
     checkpoint_path = tmp_path / "best.pt"
     torch.save(model.state_dict(), checkpoint_path)
 
-    loaded = faco_test.load_gfacs_prior_model(checkpoint_path, "cpu", guided_exploration=False)
+    loaded = faco_test.load_deepaco_prior_model(checkpoint_path, "cpu")
 
     assert isinstance(loaded, faco_test.OriginalGFACSNet)
     assert not loaded.training
+

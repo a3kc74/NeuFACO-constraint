@@ -156,7 +156,6 @@ def infer_instance(
     windows,
     n_ants: int,
     n_iter: int,
-    mini_H: int,
     threads: int | None,
     seed: int,
     cand_list_size: int,
@@ -179,8 +178,6 @@ def infer_instance(
     pin_global_best_elite: bool = False,
     prior=None,
 ):
-    if mini_H < 1:
-        raise ValueError("mini_H must be >= 1")
     if threads is not None and threads < 1:
         raise ValueError("threads must be >= 1")
 
@@ -215,21 +212,17 @@ def infer_instance(
    
     start = time.time()
     for t in range(n_iter):
-        routes = None
-        for _mini_t in range(mini_H):
-            # if _mini_t == mini_H - 1 and global_best_route is not None:
-            #     solver.set_source_route(global_best_route, best_so_far)
-            costs, routes, *_ = solver.sample(prior=prior)
-            costs_np = np.asarray(costs, dtype=np.float32)
+        costs, routes, *_ = solver.sample(prior=prior)
+        costs_np = np.asarray(costs, dtype=np.float32)
 
-            best_idx = int(np.argmin(costs_np))
-            best_cost = float(costs_np[best_idx])
-            best_route = np.asarray(routes[best_idx], dtype=np.int32)
-            if best_cost < best_so_far:
-                best_so_far = best_cost
-                global_best_route = best_route.copy()
-        
-            solver.update_pheromone(best_route, best_cost)
+        best_idx = int(np.argmin(costs_np))
+        best_cost = float(costs_np[best_idx])
+        best_route = np.asarray(routes[best_idx], dtype=np.int32)
+        if best_cost < best_so_far:
+            best_so_far = best_cost
+            global_best_route = best_route.copy()
+
+        solver.update_pheromone(best_route, best_cost)
 
         results[t] = best_so_far
         diversities[t] = route_diversity(routes)
@@ -270,7 +263,7 @@ def neural_prior(model, demands, positions, windows, cand_list_size: int, device
     heu_vec = model(pyg_data)
     return model.reshape(pyg_data, heu_vec).detach().cpu().numpy()
 
-def test(dataset, n_ants: int, n_iter: int, mini_H: int, threads: int | None, seed: int, model=None, device: str = "cpu", cand_list_size: int = 32, **solver_kwargs):
+def test(dataset, n_ants: int, n_iter: int, threads: int | None, seed: int, model=None, device: str = "cpu", cand_list_size: int = 32, **solver_kwargs):
     sum_results = torch.zeros(size=(n_iter,), dtype=torch.float32)
     sum_diversities = torch.zeros(size=(n_iter,), dtype=torch.float32)
     sum_times = 0.0
@@ -283,7 +276,6 @@ def test(dataset, n_ants: int, n_iter: int, mini_H: int, threads: int | None, se
             windows=windows.cpu(),
             n_ants=n_ants,
             n_iter=n_iter,
-            mini_H=mini_H,
             threads=threads,
             seed=seed + idx,
             cand_list_size=cand_list_size,
@@ -305,7 +297,6 @@ def write_results(
     n_instances: int,
     n_ants: int,
     n_iter: int,
-    mini_H: int,
     threads: int | None,
     seed: int,
     duration: float,
@@ -322,7 +313,6 @@ def write_results(
         f.write(f"number of instances: {n_instances}\n")
         f.write(f"device: {device}\n")
         f.write(f"n_ants: {n_ants}\n")
-        f.write(f"mini_H: {mini_H}\n")
         f.write(f"threads: {threads if threads is not None else 'default'}\n")
         f.write(f"seed: {seed}\n")
         f.write(f"average inference time: {duration}\n")
@@ -342,7 +332,6 @@ def main(
     size: int | None = None,
     n_ants: int = 100,
     n_iter: int = 10,
-    mini_H: int = 1,
     threads: int | None = None,
     seed: int = 0,
     tam: bool = False,
@@ -370,8 +359,6 @@ def main(
     neural_guide: str | Path | None = None,
     device: str = "cuda:0",
 ):
-    if mini_H < 1:
-        raise ValueError("mini_H must be >= 1")
     if threads is not None and threads < 1:
         raise ValueError("threads must be >= 1")
     if threads is not None:
@@ -398,7 +385,6 @@ def main(
     print("number of instances:", len(dataset))
     print("device:", f"{model_device}+cpu" if model is not None and model_device != "cpu" else "cpu")
     print("n_ants:", n_ants)
-    print("mini_H:", mini_H)
     print("threads:", threads if threads is not None else "default")
     print("seed:", seed)
 
@@ -406,7 +392,6 @@ def main(
         dataset,
         n_ants=n_ants,
         n_iter=n_iter,
-        mini_H=mini_H,
         threads=threads,
         seed=seed,
         model=model,
@@ -439,7 +424,7 @@ def main(
     checkpoint_name = Path(neural_guide).stem if neural_guide is not None else "none"
     result_filename = (
         f"test_result_ckpt{checkpoint_name}-{problem_name}{n_nodes}-ninst{size}-"
-        f"nants{n_ants}-niter{n_iter}-miniH{mini_H}-threads{threads if threads is not None else 'default'}-seed{seed}-faco"
+        f"nants{n_ants}-niter{n_iter}-threads{threads if threads is not None else 'default'}-seed{seed}-faco"
     )
     result_txt = out_dir / f"{result_filename}.txt"
     result_csv = out_dir / f"{result_filename}.csv"
@@ -451,7 +436,6 @@ def main(
         n_instances=len(dataset),
         n_ants=n_ants,
         n_iter=n_iter,
-        mini_H=mini_H,
         threads=threads,
         seed=seed,
         duration=duration,
@@ -468,7 +452,6 @@ def parse_args():
     parser.add_argument("nodes", type=int, help="Problem scale")
     parser.add_argument("-k", "--k_sparse", type=int, default=None, help="k_sparse / default FACO candidate list size")
     parser.add_argument("-i", "--n_iter", type=int, default=10, help="Number of FACO iterations")
-    parser.add_argument("--mini_H", type=int, default=1, help="Number of FACO mini-iterations per outer iteration")
     parser.add_argument("--threads", type=int, default=None, help="OpenMP thread count for parallel C++ FACO sampling/update")
     parser.add_argument("-n", "--n_ants", type=int, default=100, help="Number of ants")
     parser.add_argument("-s", "--size", type=int, default=None, help="Number of instances to test")
@@ -496,7 +479,7 @@ def parse_args():
     parser.add_argument("--elite_k", type=int, default=8, help="Number of quality-diverse elite source routes")
     parser.add_argument("--elite_min_diversity", type=float, default=0.15, help="Minimum edge distance between elite source routes")
     parser.add_argument("--elite_cost_tolerance", type=float, default=1.05, help="Maximum elite source cost ratio versus current best")
-    parser.add_argument("--source_count", type=int, default=2, help="Number of elite source routes used by final-mini multisource sampling")
+    parser.add_argument("--source_count", type=int, default=2, help="Number of elite source routes used by multisource sampling")
     parser.add_argument("--pin_global_best_elite", action="store_true", help="Always keep global best as one elite archive route")
     return parser.parse_args()
 
@@ -509,7 +492,6 @@ if __name__ == "__main__":
         size=args.size,
         n_ants=args.n_ants,
         n_iter=args.n_iter,
-        mini_H=args.mini_H,
         threads=args.threads,
         seed=args.seed,
         tam=args.tam,

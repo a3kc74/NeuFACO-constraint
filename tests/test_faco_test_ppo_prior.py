@@ -1,4 +1,4 @@
-﻿from pathlib import Path
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -129,8 +129,8 @@ def test_infer_instance_reuses_ppo_prior_by_outer_iteration(monkeypatch):
         positions=torch.zeros((2, 2)),
         windows=torch.ones((2, 2)),
         n_ants=1,
-        n_iter=1,
-        mini_H=3,
+        n_iter=3,
+        log_period=3,
         threads=1,
         seed=0,
         cand_list_size=1,
@@ -190,8 +190,8 @@ def test_infer_instance_can_recompute_ppo_prior_for_each_sample(monkeypatch):
         positions=torch.zeros((2, 2)),
         windows=torch.ones((2, 2)),
         n_ants=1,
-        n_iter=1,
-        mini_H=3,
+        n_iter=3,
+        log_period=3,
         threads=1,
         seed=0,
         cand_list_size=1,
@@ -216,12 +216,39 @@ def test_infer_instance_can_recompute_ppo_prior_for_each_sample(monkeypatch):
     assert priors == [0.0, 1.0, 2.0]
 
 
-def test_main_rejects_gfacs_and_ppo_together(tmp_path, monkeypatch):
+
+def test_parse_args_accepts_deepaco_pretrained(monkeypatch, tmp_path):
+    checkpoint = tmp_path / "deepaco.pt"
+    monkeypatch.setattr(
+        faco_test.sys,
+        "argv",
+        ["faco_test.py", "20", "--deepaco_pretrained", str(checkpoint), "--deepaco_prior_scale", "0.5"],
+        raising=False,
+    )
+
+    args = faco_test.parse_args()
+
+    assert args.deepaco_pretrained == checkpoint
+    assert args.deepaco_prior_scale == 0.5
+
+
+def test_main_rejects_deepaco_and_ppo_together(tmp_path, monkeypatch):
     monkeypatch.setattr(faco_test, "load_dataset", lambda *_args, **_kwargs: [])
 
-    with pytest.raises(ValueError, match="gfacs_pretrained.*ppo_pretrained"):
+    with pytest.raises(ValueError, match="Only one prior checkpoint"):
+        faco_test.main(
+            n_nodes=2,
+            deepaco_pretrained=tmp_path / "deepaco.pt",
+            ppo_pretrained=tmp_path / "ppo.pt",
+        )
+
+def test_main_rejects_multiple_prior_checkpoints(tmp_path, monkeypatch):
+    monkeypatch.setattr(faco_test, "load_dataset", lambda *_args, **_kwargs: [])
+
+    with pytest.raises(ValueError, match="Only one prior checkpoint"):
         faco_test.main(
             n_nodes=2,
             gfacs_pretrained=tmp_path / "gfacs.pt",
             ppo_pretrained=tmp_path / "ppo.pt",
         )
+

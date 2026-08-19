@@ -96,6 +96,18 @@ class MFACO_CVRP:
         granular_mode: int = 0,
         granular_wait_weight: float = 0.2,
         granular_time_warp_weight: float = 1.0,
+        hgs_soft_deep_ls: bool = False,
+        hgs_soft_cheap_ls: bool = False,
+        hgs_soft_intra_ls: bool = False,
+        hgs_deep_ls: bool = False,
+        hgs_deep_top_k: int = 0,
+        hgs_tw_penalty: float = 10.0,
+        hgs_capacity_penalty: float = 10.0,
+        hgs_adaptive_penalty: bool = False,
+        hgs_target_feasible: float = 0.8,
+        hgs_deep_rounds: int = 1,
+        hgs_deep_route_pair_prune: bool = False,
+        hgs_deep_route_pair_top_k: int = 3,
         **kwargs
     ):
         coords_np = _as_numpy_f32(coords)
@@ -278,6 +290,18 @@ class MFACO_CVRPTW(MFACO_CVRP):
         granular_mode: int = 0,
         granular_wait_weight: float = 0.2,
         granular_time_warp_weight: float = 1.0,
+        hgs_soft_deep_ls: bool = False,
+        hgs_soft_cheap_ls: bool = False,
+        hgs_soft_intra_ls: bool = False,
+        hgs_deep_ls: bool = False,
+        hgs_deep_top_k: int = 0,
+        hgs_tw_penalty: float = 10.0,
+        hgs_capacity_penalty: float = 10.0,
+        hgs_adaptive_penalty: bool = False,
+        hgs_target_feasible: float = 0.8,
+        hgs_deep_rounds: int = 1,
+        hgs_deep_route_pair_prune: bool = False,
+        hgs_deep_route_pair_top_k: int = 3,
         **kwargs
     ):
         coords_np = _as_numpy_f32(coords)
@@ -314,6 +338,18 @@ class MFACO_CVRPTW(MFACO_CVRP):
             int(granular_mode),
             float(granular_wait_weight),
             float(granular_time_warp_weight),
+            bool(hgs_soft_deep_ls),
+            bool(hgs_soft_cheap_ls),
+            bool(hgs_soft_intra_ls),
+            bool(hgs_deep_ls),
+            int(hgs_deep_top_k),
+            float(hgs_tw_penalty),
+            float(hgs_capacity_penalty),
+            bool(hgs_adaptive_penalty),
+            float(hgs_target_feasible),
+            int(hgs_deep_rounds),
+            bool(hgs_deep_route_pair_prune),
+            int(hgs_deep_route_pair_top_k),
         )
         self.device = device
         self._enable_torch_sync = enable_torch_sync

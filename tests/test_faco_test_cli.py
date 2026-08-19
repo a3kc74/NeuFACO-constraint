@@ -51,8 +51,14 @@ def run_case(tmp_path, vrptw):
     assert result_txt.exists()
     assert result_csv.exists()
     text = result_txt.read_text()
+    assert "[Data]" in text
+    assert "[FACO]" in text
+    assert "[Prior]" in text
     assert f"problem: {'vrptw' if vrptw else 'cvrptw'}" in text
     assert "checkpoint: none" in text
+    assert "ppo_device" not in text
+    assert "gfacs_device" not in text
+    assert "deepaco_device" not in text
     assert "T=1, avg. cost" in text
     assert "T=2, avg. cost" in text
 
@@ -69,7 +75,7 @@ def test_faco_test_outputs_gfacs_format_for_cvrptw(tmp_path):
 def test_faco_test_outputs_gfacs_format_for_vrptw(tmp_path):
     run_case(tmp_path, vrptw=True)
 
-def test_faco_test_supports_mini_iterations(tmp_path):
+def test_faco_test_outputs_iteration_metadata_without_mini_h(tmp_path):
     data_dir = tmp_path / "data" / "cvrptw"
     out_dir = tmp_path / "out"
     data_dir.mkdir(parents=True)
@@ -81,7 +87,6 @@ def test_faco_test_supports_mini_iterations(tmp_path):
         size=1,
         n_ants=3,
         n_iter=2,
-        mini_H=2,
         seed=5,
         data_dir=data_dir,
         output_dir=out_dir,
@@ -91,9 +96,9 @@ def test_faco_test_supports_mini_iterations(tmp_path):
     assert len(avg_cost) == 2
     assert len(avg_diversity) == 2
     assert duration >= 0
-    assert "miniH2" in result_txt.name
+    assert "miniH" not in result_txt.name
     text = result_txt.read_text()
-    assert "mini_H: 2" in text
+    assert "mini_H" not in text
     assert "T=1, avg. cost" in text
     assert "T=2, avg. cost" in text
 
@@ -101,7 +106,7 @@ def test_faco_test_supports_mini_iterations(tmp_path):
         rows = list(csv.DictReader(f))
     assert [row["T"] for row in rows] == ["1", "2"]
 
-def test_faco_test_falls_back_to_global_best_source_for_last_mini_iteration(monkeypatch):
+def test_faco_test_falls_back_to_global_best_source_on_log_step(monkeypatch):
     calls = []
 
     class FakeSolver:
@@ -143,8 +148,8 @@ def test_faco_test_falls_back_to_global_best_source_for_last_mini_iteration(monk
         positions=positions,
         windows=windows,
         n_ants=2,
-        n_iter=1,
-        mini_H=2,
+        n_iter=2,
+        log_period=2,
         threads=None,
         seed=1,
         cand_list_size=2,
@@ -308,8 +313,8 @@ def test_faco_test_uses_multisource_sampling_for_last_mini_iteration(monkeypatch
         positions=positions,
         windows=windows,
         n_ants=2,
-        n_iter=1,
-        mini_H=2,
+        n_iter=2,
+        log_period=2,
         threads=None,
         seed=1,
         cand_list_size=2,
@@ -366,3 +371,50 @@ def test_faco_test_supports_cpp_thread_count(tmp_path):
     assert result_csv.exists()
     assert "threads1" in result_txt.name
     assert "threads: 1" in result_txt.read_text()
+
+def test_faco_test_accepts_hgs_soft_intra_ls_flag(tmp_path):
+    data_dir = tmp_path / "data" / "cvrptw"
+    out_dir = tmp_path / "out"
+    data_dir.mkdir(parents=True)
+    make_dataset(data_dir / "testDataset-20.pt", n_nodes=20, n_instances=1)
+
+    _avg_cost, _avg_diversity, _duration, result_txt, _result_csv = main(
+        n_nodes=20,
+        k_sparse=4,
+        size=1,
+        n_ants=2,
+        n_iter=1,
+        seed=7,
+        data_dir=data_dir,
+        output_dir=out_dir,
+        use_local_search=True,
+        hgs_soft_intra_ls=True,
+    )
+
+    assert "hgs_soft_intra_ls: True" in result_txt.read_text()
+
+def test_faco_test_accepts_deep_route_pair_pruning_flags(tmp_path):
+    data_dir = tmp_path / "data" / "cvrptw"
+    out_dir = tmp_path / "out"
+    data_dir.mkdir(parents=True)
+    make_dataset(data_dir / "testDataset-20.pt", n_nodes=20, n_instances=1)
+
+    avg_cost, _avg_diversity, _duration, result_txt, _result_csv = main(
+        n_nodes=20,
+        k_sparse=4,
+        size=1,
+        n_ants=2,
+        n_iter=1,
+        seed=9,
+        data_dir=data_dir,
+        output_dir=out_dir,
+        use_local_search=True,
+        hgs_soft_deep_ls=True,
+        hgs_deep_ls=True,
+        hgs_deep_top_k=1,
+        hgs_deep_route_pair_prune=True,
+        hgs_deep_route_pair_top_k=2,
+    )
+
+    assert len(avg_cost) == 1
+    assert result_txt.exists()
