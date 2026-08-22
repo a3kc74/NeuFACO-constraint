@@ -95,10 +95,67 @@ def test_train_instance_samples_with_faco_and_replay(monkeypatch):
     assert calls["replay_prior_requires_grad"] is True
 
 
+def test_train_instance_can_force_granular_gnn_graph(monkeypatch):
+    class GranularPyg:
+        pass
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(1.0))
+
+        def forward(self, pyg_data):
+            calls["pyg_data"] = pyg_data
+            return self.weight * torch.ones(3, 3)
+
+        def reshape(self, _pyg_data, values):
+            return values
+
+    class FakeSolver:
+        def __init__(self, *args, **kwargs):
+            self.nn_list = torch.tensor([[0, 1], [0, 2], [1, 2]]).numpy()
+            self.pheromone_sparse = torch.ones(3, 2)
+            self.h_sparse_torch = torch.ones(3, 2)
+
+        def sample(self, **_kwargs):
+            return [1.0, 2.0], [], None, None, {"starts": [0, 0, 0], "curr_nodes": [], "is_stochastic": [], "pick_j": [], "valid_mask": []}, [], [], 0, None
+
+    def fake_granular_pyg(_demands, _distances, _windows, solver, _device):
+        calls["granular_solver"] = solver
+        return granular_pyg
+
+    def fake_replay(_traces, _tau, _eta, prior_logits, **_kwargs):
+        return prior_logits.sum() * torch.tensor([0.1, 0.2]), None, torch.ones(2, dtype=torch.long)
+
+    calls = {}
+    granular_pyg = GranularPyg()
+    monkeypatch.setattr(deepaco_trainer, "MFACO_CVRPTW", FakeSolver)
+    monkeypatch.setattr(deepaco_trainer.faco_test, "gen_granular_pyg_data", fake_granular_pyg)
+    monkeypatch.setattr(deepaco_trainer, "replay_logp_from_trace", fake_replay)
+    monkeypatch.setattr(deepaco_trainer, "DEVICE", "cpu")
+
+    model = DummyModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    data = [(object(), torch.zeros(3), torch.ones(3, 3), torch.zeros(3, 2), torch.zeros(3, 2))]
+
+    deepaco_trainer.train_instance(
+        model,
+        optimizer,
+        data,
+        n_ants=2,
+        faco_params={"deepaco_graph_mode": "granular", "use_local_search": False},
+        k_sparse=2,
+    )
+
+    assert calls["pyg_data"] is granular_pyg
+    assert isinstance(calls["granular_solver"], FakeSolver)
+
+
 def test_validation_uses_faco_infer_final_cost(monkeypatch):
     def fake_infer_instance(*args, **kwargs):
         calls["deepaco_model"] = kwargs["deepaco_model"]
         calls["n_iter"] = kwargs["n_iter"]
+        calls["deepaco_graph_mode"] = kwargs["deepaco_graph_mode"]
         return torch.tensor([3.0, 2.0]), torch.tensor([0.1, 0.2]), 0.0, [1, 2], {}
 
     calls = {}
@@ -113,10 +170,11 @@ def test_validation_uses_faco_infer_final_cost(monkeypatch):
         net=model,
         epoch=0,
         steps_per_epoch=1,
-        faco_params={"val_n_iter": 2, "use_local_search": False},
+        faco_params={"val_n_iter": 2, "use_local_search": False, "deepaco_graph_mode": "granular"},
         k_sparse=2,
     )
 
     assert result == 2.0
     assert calls["deepaco_model"] is model
     assert calls["n_iter"] == 2
+    assert calls["deepaco_graph_mode"] == "granular"

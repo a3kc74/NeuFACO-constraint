@@ -179,6 +179,21 @@ def gen_deepaco_pyg_data(demands, distances, windows, device: str, k_sparse: int
     x = torch.cat([demands.unsqueeze(1), windows], dim=-1)
     return Data(x=x.float(), edge_attr=edge_attr.float(), edge_index=edge_index)
 
+def gen_granular_pyg_data(demands, distances, windows, solver, device: str):
+    demands = torch.as_tensor(demands, dtype=torch.float32, device=device)
+    distances = torch.as_tensor(distances, dtype=torch.float32, device=device)
+    windows = torch.as_tensor(windows, dtype=torch.float32, device=device)
+    nn_list = torch.as_tensor(np.asarray(solver.nn_list), dtype=torch.long, device=device)
+    if nn_list.numel() == 0:
+        edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+        edge_attr = torch.empty((0, 1), dtype=torch.float32, device=device)
+    else:
+        rows = torch.arange(nn_list.shape[0], device=device).unsqueeze(1).expand_as(nn_list)
+        edge_index = torch.stack([rows.reshape(-1), nn_list.reshape(-1)], dim=0)
+        edge_attr = distances[edge_index[0], edge_index[1]].reshape(-1, 1)
+    x = torch.cat([demands.unsqueeze(1), windows], dim=-1)
+    return Data(x=x.float(), edge_attr=edge_attr.float(), edge_index=edge_index)
+
 
 def build_instance_for_prior(demands, distances, windows):
     return {
@@ -197,16 +212,26 @@ def deepaco_prior(
     device: str,
     prior_scale: float = 1.0,
     prior_center: bool = False,
+    graph_mode: str = "distance",
 ):
     if model is None:
         return None
-    pyg_data = gen_deepaco_pyg_data(
-        instance["demand"],
-        instance["distances"],
-        instance["windows"],
-        device=device,
-        k_sparse=k_sparse,
-    )
+    if graph_mode == "granular":
+        pyg_data = gen_granular_pyg_data(
+            instance["demand"],
+            instance["distances"],
+            instance["windows"],
+            solver,
+            device=device,
+        )
+    else:
+        pyg_data = gen_deepaco_pyg_data(
+            instance["demand"],
+            instance["distances"],
+            instance["windows"],
+            device=device,
+            k_sparse=k_sparse,
+        )
     heuristic_mat = model.reshape(pyg_data, model(pyg_data))
     nn_list = torch.as_tensor(np.asarray(solver.nn_list), dtype=torch.long, device=heuristic_mat.device)
     rows = torch.arange(nn_list.shape[0], device=heuristic_mat.device).unsqueeze(1)
@@ -347,6 +372,7 @@ def infer_instance(
     deepaco_device: str = "cpu",
     deepaco_prior_scale: float = 1.0,
     deepaco_prior_center: bool = False,
+    deepaco_graph_mode: str = "distance",
     ppo_model=None,
     ppo_device: str = "cpu",
     ppo_edge_feature_mode: str = "full",
@@ -426,6 +452,7 @@ def infer_instance(
         device=deepaco_device,
         prior_scale=deepaco_prior_scale,
         prior_center=deepaco_prior_center,
+        graph_mode=deepaco_graph_mode,
     )
 
     def current_prior():
@@ -580,6 +607,7 @@ def write_results(
     deepaco_device: str = "cpu",
     deepaco_prior_scale: float = 1.0,
     deepaco_prior_center: bool = False,
+    deepaco_graph_mode: str = "distance",
     ppo_device: str = "cpu",
     ppo_norm_type: str = "batch",
     ppo_edge_feature_mode: str = "full",
@@ -634,6 +662,7 @@ def write_results(
             f.write(f"deepaco_device: {deepaco_device}\n")
             f.write(f"deepaco_prior_scale: {deepaco_prior_scale}\n")
             f.write(f"deepaco_prior_center: {deepaco_prior_center}\n")
+            f.write(f"deepaco_graph_mode: {deepaco_graph_mode}\n")
         elif checkpoint_type == "ppo":
             f.write("[PPO Prior]\n")
             f.write(f"checkpoint: {checkpoint}\n")
@@ -718,6 +747,7 @@ def main(
     deepaco_device: str | None = None,
     deepaco_prior_scale: float = 1.0,
     deepaco_prior_center: bool = False,
+    deepaco_graph_mode: str = "distance",
     gfacs_pretrained: str | Path | None = None,
     gfacs_device: str | None = None,
     gfacs_prior_scale: float = 1.0,
@@ -844,6 +874,7 @@ def main(
             "deepaco_device": deepaco_device,
             "deepaco_prior_scale": deepaco_prior_scale,
             "deepaco_prior_center": deepaco_prior_center,
+            "deepaco_graph_mode": deepaco_graph_mode,
         })
     elif ppo_pretrained is not None:
         print_block("PPO Prior", {
@@ -904,6 +935,7 @@ def main(
         deepaco_device=deepaco_device,
         deepaco_prior_scale=deepaco_prior_scale,
         deepaco_prior_center=deepaco_prior_center,
+        deepaco_graph_mode=deepaco_graph_mode,
         ppo_model=ppo_model,
         ppo_device=ppo_device,
         ppo_edge_feature_mode=ppo_edge_feature_mode,
@@ -968,6 +1000,7 @@ def main(
         deepaco_device=deepaco_device,
         deepaco_prior_scale=deepaco_prior_scale,
         deepaco_prior_center=deepaco_prior_center,
+        deepaco_graph_mode=deepaco_graph_mode,
         ppo_device=ppo_device,
         ppo_norm_type=ppo_norm_type,
         ppo_edge_feature_mode=ppo_edge_feature_mode,
@@ -1046,6 +1079,7 @@ def parse_args():
     parser.add_argument("--deepaco_device", type=str, default=None, help="Device for DeepACO prior computation; defaults to cuda:0 if available else cpu")
     parser.add_argument("--deepaco_prior_scale", type=float, default=1.0, help="Multiplier applied to DeepACO prior logits before sampling")
     parser.add_argument("--deepaco_prior_center", action="store_true", help="Row-center DeepACO prior logits before scaling")
+    parser.add_argument("--deepaco_graph_mode", type=str, choices=["distance", "granular"], default="distance", help="Graph mode for DeepACO GNN input")
     parser.add_argument("--gfacs_pretrained", type=Path, default=None, help="Deprecated alias for --deepaco_pretrained")
     parser.add_argument("--gfacs_device", type=str, default=None, help="Deprecated alias for --deepaco_device")
     parser.add_argument("--gfacs_prior_scale", type=float, default=1.0, help="Deprecated alias for --deepaco_prior_scale")
@@ -1121,6 +1155,7 @@ if __name__ == "__main__":
         deepaco_device=args.deepaco_device,
         deepaco_prior_scale=args.deepaco_prior_scale,
         deepaco_prior_center=args.deepaco_prior_center,
+        deepaco_graph_mode=args.deepaco_graph_mode,
         gfacs_pretrained=args.gfacs_pretrained,
         gfacs_device=args.gfacs_device,
         gfacs_prior_scale=args.gfacs_prior_scale,

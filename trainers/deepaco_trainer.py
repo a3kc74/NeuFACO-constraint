@@ -56,6 +56,7 @@ DEFAULT_FACO_PARAMS = {
     "parallel_traced": False,
     "deepaco_prior_scale": 1.0,
     "deepaco_prior_center": False,
+    "deepaco_graph_mode": "distance",
 }
 
 
@@ -166,6 +167,8 @@ def train_instance(
 
     for pyg_data, demands, distances, positions, windows in data:
         solver = build_faco_solver(demands, positions, windows, n_ants, cand_list_size, params)
+        if params["deepaco_graph_mode"] == "granular":
+            pyg_data = faco_test.gen_granular_pyg_data(demands, distances, windows, solver, DEVICE)
         tau = solver.pheromone_sparse.detach().clone().to(DEVICE)
         eta = solver.h_sparse_torch.detach().clone().to(DEVICE)
         prior_logits = sparse_deepaco_prior_tensor(
@@ -284,6 +287,7 @@ def infer_instance(
         deepaco_device=DEVICE,
         deepaco_prior_scale=params["deepaco_prior_scale"],
         deepaco_prior_center=params["deepaco_prior_center"],
+        deepaco_graph_mode=params["deepaco_graph_mode"],
         distances=distances,
     )
     return np.array([float(results[-1]), float(diversities[-1])])
@@ -349,7 +353,7 @@ def train(
     val_size=None,
     val_interval=5,
     pretrained=None,
-    savepath="../pretrained/cvrptw-deepaco",
+    savepath="pretrained/cvrptw-deepaco",
     run_name="",
     invtemp_schedule_params=(1.0, 1.0, 5),
     use_ls_reward=False,
@@ -424,7 +428,7 @@ if __name__ == "__main__":
     parser.add_argument("-s", "--steps", type=int, default=20, help="Steps per epoch")
     parser.add_argument("-e", "--epochs", type=int, default=50, help="Epochs to run")
     parser.add_argument("-v", "--val_size", type=int, default=10, help="Number of instances for validation")
-    parser.add_argument("-o", "--output", type=str, default="/pretrained/cvrptw-deepaco", help="Directory to store checkpoints")
+    parser.add_argument("-o", "--output", type=str, default="pretrained/cvrptw-deepaco", help="Directory to store checkpoints")
     parser.add_argument("--val_interval", type=int, default=5, help="Interval to validate model")
     parser.add_argument("--disable_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--run_name", type=str, default="", help="Run name")
@@ -474,6 +478,7 @@ if __name__ == "__main__":
     parser.add_argument("--parallel_traced", action="store_true")
     parser.add_argument("--deepaco_prior_scale", type=float, default=1.0)
     parser.add_argument("--deepaco_prior_center", action="store_true")
+    parser.add_argument("--deepaco_graph_mode", type=str, choices=["distance", "granular"], default="distance")
 
     args = parser.parse_args()
 
@@ -548,6 +553,7 @@ if __name__ == "__main__":
         "parallel_traced": args.parallel_traced,
         "deepaco_prior_scale": args.deepaco_prior_scale,
         "deepaco_prior_center": args.deepaco_prior_center,
+        "deepaco_graph_mode": args.deepaco_graph_mode,
         "seed": args.seed,
     }
 

@@ -113,6 +113,67 @@ def test_deepaco_prior_can_row_center_and_scale(monkeypatch):
     assert np.allclose(prior, expected)
 
 
+def test_gen_granular_pyg_data_uses_solver_candidate_list():
+    class FakeSolver:
+        nn_list = np.array([[1, 2], [0, 2], [1, 0]], dtype=np.int32)
+
+    distances = torch.tensor(
+        [
+            [0.0, 1.0, 2.0],
+            [1.0, 0.0, 3.0],
+            [2.0, 3.0, 0.0],
+        ]
+    )
+    pyg_data = faco_test.gen_granular_pyg_data(
+        demands=torch.tensor([0.0, 0.1, 0.2]),
+        distances=distances,
+        windows=torch.ones((3, 2)),
+        solver=FakeSolver(),
+        device="cpu",
+    )
+
+    expected_edge_index = torch.tensor([[0, 0, 1, 1, 2, 2], [1, 2, 0, 2, 1, 0]])
+    expected_edge_attr = torch.tensor([[1.0], [2.0], [1.0], [3.0], [3.0], [2.0]])
+    assert torch.equal(pyg_data.edge_index, expected_edge_index)
+    assert torch.allclose(pyg_data.edge_attr, expected_edge_attr)
+    assert pyg_data.x.shape == (3, 3)
+
+
+def test_deepaco_prior_can_use_granular_graph(monkeypatch):
+    captured = {}
+
+    class FakeDeepACO(torch.nn.Module):
+        def forward(self, pyg_data):
+            captured["edge_index"] = pyg_data.edge_index.clone()
+            return torch.ones(pyg_data.edge_index.shape[1])
+
+        @staticmethod
+        def reshape(pyg_data, vector):
+            matrix = torch.zeros((3, 3), dtype=torch.float32)
+            matrix[pyg_data.edge_index[0], pyg_data.edge_index[1]] = vector
+            return matrix
+
+    class FakeSolver:
+        nn_list = np.array([[1, 2], [0, 2], [1, 0]], dtype=np.int32)
+
+    prior = faco_test.deepaco_prior(
+        FakeDeepACO(),
+        {
+            "demand": torch.zeros(3),
+            "distances": torch.ones((3, 3)),
+            "windows": torch.ones((3, 2)),
+        },
+        solver=FakeSolver(),
+        k_sparse=2,
+        device="cpu",
+        graph_mode="granular",
+    )
+
+    assert prior.shape == (3, 2)
+    assert np.allclose(prior, np.zeros((3, 2), dtype=np.float32))
+    assert torch.equal(captured["edge_index"], torch.tensor([[0, 0, 1, 1, 2, 2], [1, 2, 0, 2, 1, 0]]))
+
+
 def test_load_deepaco_prior_model_loads_deepaco_trainer_checkpoint(tmp_path):
     model = faco_test.OriginalGFACSNet(gfn=False)
     checkpoint_path = tmp_path / "best.pt"
