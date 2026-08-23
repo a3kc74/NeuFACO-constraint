@@ -26,7 +26,7 @@ MFACO_CVRP::MFACO_CVRP(const float *coords_ptr, const float *demand_ptr,
                        float p_best_, bool use_local_search_,
                        bool disable_heuristic_, bool extend_ls_,
                        bool smooth_mmas_, int32_t fixed_steps_, bool nls_,
-                       int32_t T_nls_)
+                       int32_t T_nls_, bool deep_nls_)
     : n(n_), m(n_ - 1), n_ants(n_ants_), k(std::min(cand_list_size, n_ - 1)),
       bl(std::min(backup_list_size, std::max(0, n_ - 1 - k))),
       min_new_edges(min_new_edges_), fixed_steps(fixed_steps_), rho(decay),
@@ -34,7 +34,7 @@ MFACO_CVRP::MFACO_CVRP(const float *coords_ptr, const float *demand_ptr,
       disable_heuristic(disable_heuristic_), extend_ls(extend_ls_),
       smooth_mmas(smooth_mmas_), capacity(capacity_),
       capacity_int(static_cast<int64_t>(std::round(capacity_ * DEMAND_SCALE))),
-      nls(nls_), T_nls(T_nls_), use_relocate(true), use_swap(true),
+      nls(nls_), deep_nls(deep_nls_), T_nls(T_nls_), use_relocate(true), use_swap(true),
       use_2opt_star(true), use_fts_checks(true) {
   if (!coords_ptr || !demand_ptr) {
     throw std::runtime_error("coords_ptr and demand_ptr must not be null");
@@ -2888,6 +2888,185 @@ float MFACO_CVRP::hgs_deep_local_search(std::vector<int32_t> &route,
 }
 
 // MFACO_CVRP::sample_ant_direct / traced (Relocation-Based Sampling)
+bool MFACO_CVRP::run_local_search_pipeline(std::vector<int32_t> &route_out,
+                                           std::vector<int32_t> &checklist,
+                                           std::vector<uint8_t> &in_checklist,
+                                           bool allow_deep_ls) {
+  if (!use_local_search || checklist.empty())
+    return !has_time_windows || route_fully_feasible(route_out);
+
+  std::vector<int32_t> route_before_ls;
+  if (has_time_windows)
+    route_before_ls = route_out;
+
+  auto route_cost = [&](const std::vector<int32_t> &route) -> float {
+    float cost = 0.0f;
+    for (size_t i = 0; i + 1 < route.size(); ++i)
+      cost += dist(route[i], route[i + 1]);
+    return cost;
+  };
+
+  auto ls_start = std::chrono::high_resolution_clock::now();
+  intra_route_oropt(route_out, checklist, 1);
+  intra_route_oropt(route_out, checklist, 2);
+  intra_route_oropt(route_out, checklist, 3);
+  intra_route_ls(route_out, checklist);
+  auto ls_end = std::chrono::high_resolution_clock::now();
+  double intra_elapsed = std::chrono::duration<double>(ls_end - ls_start).count();
+#pragma omp atomic
+  time_intra_ls += intra_elapsed;
+#pragma omp atomic
+  count_intra_ls += 4;
+
+  std::vector<int32_t> pos_ls(n, -1);
+  std::vector<int32_t> route_before_inter;
+  if (has_time_windows && hgs_soft_cheap_ls)
+    route_before_inter = route_out;
+  auto inter_start = std::chrono::high_resolution_clock::now();
+  inter_route_ls_optimized(route_out, pos_ls, checklist, in_checklist);
+  auto inter_end = std::chrono::high_resolution_clock::now();
+  double inter_elapsed = std::chrono::duration<double>(inter_end - inter_start).count();
+#pragma omp atomic
+  time_inter_ls += inter_elapsed;
+#pragma omp atomic
+  count_inter_ls++;
+  if (has_time_windows && hgs_soft_cheap_ls && !route_fully_feasible(route_out))
+    route_out.swap(route_before_inter);
+
+  std::vector<int32_t> route_before_intra;
+  if (has_time_windows && hgs_soft_intra_ls)
+    route_before_intra = route_out;
+  ls_start = std::chrono::high_resolution_clock::now();
+  intra_route_oropt(route_out, checklist, 1);
+  intra_route_oropt(route_out, checklist, 2);
+  intra_route_oropt(route_out, checklist, 3);
+  intra_route_ls(route_out, checklist);
+  ls_end = std::chrono::high_resolution_clock::now();
+  intra_elapsed = std::chrono::duration<double>(ls_end - ls_start).count();
+#pragma omp atomic
+  time_intra_ls += intra_elapsed;
+#pragma omp atomic
+  count_intra_ls += 4;
+  if (has_time_windows && hgs_soft_intra_ls && !route_fully_feasible(route_out))
+    route_out.swap(route_before_intra);
+
+  if (allow_deep_ls && hgs_deep_ls && hgs_deep_top_k <= 0) {
+    std::vector<int32_t> route_before_deep;
+    if (has_time_windows)
+      route_before_deep = route_out;
+    auto deep_start = std::chrono::high_resolution_clock::now();
+    hgs_deep_local_search(route_out, checklist);
+    auto deep_end = std::chrono::high_resolution_clock::now();
+    double deep_elapsed = std::chrono::duration<double>(deep_end - deep_start).count();
+#pragma omp atomic
+    time_deep_ls += deep_elapsed;
+#pragma omp atomic
+    count_deep_ls++;
+    if (has_time_windows && !route_fully_feasible(route_out))
+      route_out.swap(route_before_deep);
+  }
+  if (has_time_windows && !route_fully_feasible(route_out))
+    route_out.swap(route_before_ls);
+
+  if (has_time_windows && !route_fully_feasible(route_out)) {
+    enforce_time_windows(route_out);
+    if (!route_fully_feasible(route_out))
+      route_out = source_route;
+  }
+  return !has_time_windows || route_fully_feasible(route_out);
+}
+
+void MFACO_CVRP::run_neural_local_search(std::vector<int32_t> &route_out,
+                                         std::vector<int32_t> &checklist,
+                                         std::vector<uint8_t> &in_checklist,
+                                         const float *prior_ptr,
+                                         int32_t iter_idx,
+                                         bool enable_nls) {
+  if (!enable_nls || !nls || T_nls <= 0 || checklist.empty() || prior_ptr == nullptr)
+    return;
+
+  auto route_cost = [&](const std::vector<int32_t> &route) -> float {
+    float cost = 0.0f;
+    for (size_t i = 0; i + 1 < route.size(); ++i)
+      cost += dist(route[i], route[i + 1]);
+    return cost;
+  };
+
+  struct RankedNode {
+    int32_t node;
+    float score;
+  };
+
+  auto node_score = [&](int32_t node) -> float {
+    if (node <= 0 || node >= n)
+      return 0.0f;
+    const float *row = prior_ptr ? (prior_ptr + (size_t)node * (size_t)k)
+                                 : (heuristic_sparse.data() + (size_t)node * (size_t)k);
+    float score = 0.0f;
+    for (int32_t jj = 0; jj < k; ++jj)
+      score += row[jj];
+    return score / std::max(1, k);
+  };
+
+  std::vector<int32_t> current_route = route_out;
+  std::vector<int32_t> current_checklist = checklist;
+  std::vector<uint8_t> current_in_checklist = in_checklist;
+  std::vector<int32_t> best_route = route_out;
+  std::vector<int32_t> best_checklist = checklist;
+  std::vector<uint8_t> best_in_checklist = in_checklist;
+  float best_cost = route_cost(route_out);
+
+  for (int32_t t = 0; t < T_nls; ++t) {
+    std::vector<RankedNode> ranked;
+    ranked.reserve(current_checklist.size());
+    for (int32_t node : current_checklist) {
+      if (node > 0 && node < n)
+        ranked.push_back({node, node_score(node)});
+    }
+    if (ranked.empty())
+      break;
+
+    std::stable_sort(ranked.begin(), ranked.end(), [](const RankedNode &lhs,
+                                                      const RankedNode &rhs) {
+      if (lhs.score != rhs.score)
+        return lhs.score > rhs.score;
+      return lhs.node < rhs.node;
+    });
+
+    std::vector<int32_t> perturbed_checklist;
+    perturbed_checklist.reserve(ranked.size());
+    const size_t offset = (size_t)((iter_idx + t) % (int32_t)ranked.size());
+    for (size_t i = 0; i < ranked.size(); ++i)
+      perturbed_checklist.push_back(ranked[(i + offset) % ranked.size()].node);
+
+    std::vector<uint8_t> perturbed_in_checklist(n, 0);
+    for (int32_t node : perturbed_checklist)
+      perturbed_in_checklist[(size_t)node] = 1;
+
+    std::vector<int32_t> work_route = current_route;
+    bool feasible = run_local_search_pipeline(work_route, perturbed_checklist,
+                                              perturbed_in_checklist,
+                                              deep_nls);
+    (void)feasible;
+
+    float cost = route_cost(work_route);
+    current_route.swap(work_route);
+    current_checklist.swap(perturbed_checklist);
+    current_in_checklist.swap(perturbed_in_checklist);
+
+    if (cost + 1e-6f < best_cost) {
+      best_cost = cost;
+      best_route = current_route;
+      best_checklist = current_checklist;
+      best_in_checklist = current_in_checklist;
+    }
+  }
+
+  route_out.swap(best_route);
+  checklist.swap(best_checklist);
+  in_checklist.swap(best_in_checklist);
+}
+
 // ============================================================================
 
 float MFACO_CVRP::sample_ant_direct(const float *probmat, int32_t start_node,
@@ -3210,69 +3389,13 @@ float MFACO_CVRP::sample_ant_direct(const float *probmat, int32_t start_node,
 
   // 6. Apply Local Search
   if (use_local_search && !checklist.empty()) {
-    // Intra-Route Or-opt (1/2/3) + Intra-Route LS (2-opt)
-    auto intra_start = std::chrono::high_resolution_clock::now();
-    intra_route_oropt(route_out, checklist, 1);
-    intra_route_oropt(route_out, checklist, 2);
-    intra_route_oropt(route_out, checklist, 3);
-    intra_route_ls(route_out, checklist);
-    auto intra_end = std::chrono::high_resolution_clock::now();
-    double intra_elapsed = std::chrono::duration<double>(intra_end - intra_start).count();
-#pragma omp atomic
-    time_intra_ls += intra_elapsed;
-#pragma omp atomic
-    count_intra_ls += 4;
-    // Inter-Route LS
-    std::vector<int32_t> pos_ls(n, -1);
-    std::vector<int32_t> route_before_inter;
-    if (has_time_windows && hgs_soft_cheap_ls)
-      route_before_inter = route_out;
-    auto inter_start = std::chrono::high_resolution_clock::now();
-    inter_route_ls_optimized(route_out, pos_ls, checklist, in_checklist);
-    auto inter_end = std::chrono::high_resolution_clock::now();
-    double inter_elapsed = std::chrono::duration<double>(inter_end - inter_start).count();
-#pragma omp atomic
-    time_inter_ls += inter_elapsed;
-#pragma omp atomic
-    count_inter_ls++;
-    if (has_time_windows && hgs_soft_cheap_ls && !route_fully_feasible(route_out))
-      route_out.swap(route_before_inter);
-    std::vector<int32_t> route_before_intra;
-    if (has_time_windows && hgs_soft_intra_ls)
-      route_before_intra = route_out;
-    // Intra-Route Or-opt (1/2/3) + Intra-Route LS (2-opt)
-    intra_start = std::chrono::high_resolution_clock::now();
-    intra_route_oropt(route_out, checklist, 1);
-    intra_route_oropt(route_out, checklist, 2);
-    intra_route_oropt(route_out, checklist, 3);
-    intra_route_ls(route_out, checklist);
-    intra_end = std::chrono::high_resolution_clock::now();
-    intra_elapsed = std::chrono::duration<double>(intra_end - intra_start).count();
-#pragma omp atomic
-    time_intra_ls += intra_elapsed;
-#pragma omp atomic
-    count_intra_ls += 4;
-    if (has_time_windows && hgs_soft_intra_ls && !route_fully_feasible(route_out))
-      route_out.swap(route_before_intra);
-    if (hgs_deep_ls && hgs_deep_top_k <= 0) {
-      std::vector<int32_t> route_before_deep;
-      if (has_time_windows)
-        route_before_deep = route_out;
-      auto deep_start = std::chrono::high_resolution_clock::now();
-      hgs_deep_local_search(route_out, checklist);
-      auto deep_end = std::chrono::high_resolution_clock::now();
-      double deep_elapsed = std::chrono::duration<double>(deep_end - deep_start).count();
-#pragma omp atomic
-      time_deep_ls += deep_elapsed;
-#pragma omp atomic
-      count_deep_ls++;
-      if (has_time_windows && !route_fully_feasible(route_out))
-        route_out.swap(route_before_deep);
+    final_ls_feasible_out = run_local_search_pipeline(route_out, checklist,
+                                                      in_checklist, true);
+    if (nls) {
+      run_neural_local_search(route_out, checklist, in_checklist, prior, 0, true);
+      final_ls_feasible_out = !has_time_windows || route_fully_feasible(route_out);
     }
   }
-
-  if (has_time_windows && !route_fully_feasible(route_out))
-    route_out.swap(route_before_ls);
   final_ls_feasible_out = !has_time_windows || route_fully_feasible(route_out);
   if (has_time_windows && !route_fully_feasible(route_out)) {
     enforce_time_windows(route_out);
@@ -4033,70 +4156,12 @@ float MFACO_CVRP::sample_ant_direct_traced(
 
   // 6. Apply Local Search
   if (use_local_search && !checklist.empty()) {
-    std::vector<int32_t> route_before_ls;
-    if (has_time_windows)
-      route_before_ls = route_out;
-    // Intra-Route Or-opt (1/2/3) + Intra-Route LS (2-opt)
-    auto intra_start = std::chrono::high_resolution_clock::now();
-    intra_route_oropt(route_out, checklist, 1);
-    intra_route_oropt(route_out, checklist, 2);
-    intra_route_oropt(route_out, checklist, 3);
-    intra_route_ls(route_out, checklist);
-    auto intra_end = std::chrono::high_resolution_clock::now();
-    double intra_elapsed = std::chrono::duration<double>(intra_end - intra_start).count();
-#pragma omp atomic
-    time_intra_ls += intra_elapsed;
-#pragma omp atomic
-    count_intra_ls += 4;
-    // Inter-Route LS
-    std::vector<int32_t> pos_ls(n, -1);
-    std::vector<int32_t> route_before_inter;
-    if (has_time_windows && hgs_soft_cheap_ls)
-      route_before_inter = route_out;
-    auto inter_start = std::chrono::high_resolution_clock::now();
-    inter_route_ls_optimized(route_out, pos_ls, checklist, in_checklist);
-    auto inter_end = std::chrono::high_resolution_clock::now();
-    double inter_elapsed = std::chrono::duration<double>(inter_end - inter_start).count();
-#pragma omp atomic
-    time_inter_ls += inter_elapsed;
-#pragma omp atomic
-    count_inter_ls++;
-    if (has_time_windows && hgs_soft_cheap_ls && !route_fully_feasible(route_out))
-      route_out.swap(route_before_inter);
-    std::vector<int32_t> route_before_intra;
-    if (has_time_windows && hgs_soft_intra_ls)
-      route_before_intra = route_out;
-    // Intra-Route Or-opt (1/2/3) + Intra-Route LS (2-opt)
-    intra_start = std::chrono::high_resolution_clock::now();
-    intra_route_oropt(route_out, checklist, 1);
-    intra_route_oropt(route_out, checklist, 2);
-    intra_route_oropt(route_out, checklist, 3);
-    intra_route_ls(route_out, checklist);
-    intra_end = std::chrono::high_resolution_clock::now();
-    intra_elapsed = std::chrono::duration<double>(intra_end - intra_start).count();
-#pragma omp atomic
-    time_intra_ls += intra_elapsed;
-#pragma omp atomic
-    count_intra_ls += 4;
-    if (has_time_windows && hgs_soft_intra_ls && !route_fully_feasible(route_out))
-      route_out.swap(route_before_intra);
-    if (hgs_deep_ls && hgs_deep_top_k <= 0) {
-      std::vector<int32_t> route_before_deep;
-      if (has_time_windows)
-        route_before_deep = route_out;
-      auto deep_start = std::chrono::high_resolution_clock::now();
-      hgs_deep_local_search(route_out, checklist);
-      auto deep_end = std::chrono::high_resolution_clock::now();
-      double deep_elapsed = std::chrono::duration<double>(deep_end - deep_start).count();
-#pragma omp atomic
-      time_deep_ls += deep_elapsed;
-#pragma omp atomic
-      count_deep_ls++;
-      if (has_time_windows && !route_fully_feasible(route_out))
-        route_out.swap(route_before_deep);
+    final_ls_feasible_out = run_local_search_pipeline(route_out, checklist,
+                                                      in_checklist, true);
+    if (nls) {
+      run_neural_local_search(route_out, checklist, in_checklist, prior, 0, false);
+      final_ls_feasible_out = !has_time_windows || route_fully_feasible(route_out);
     }
-    if (has_time_windows && !route_fully_feasible(route_out))
-      route_out.swap(route_before_ls);
   }
   final_ls_feasible_out = !has_time_windows || route_fully_feasible(route_out);
   if (has_time_windows && !route_fully_feasible(route_out)) {

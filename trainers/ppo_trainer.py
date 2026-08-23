@@ -63,6 +63,7 @@ def train_instance(
     extend_ls=False,
     nls=False,
     T_nls=10,
+    deep_nls=False,
 ):
     model.train()
     all_experiences = []
@@ -97,6 +98,7 @@ def train_instance(
             extend_ls=extend_ls,
             nls=nls,
             T_nls=T_nls,
+            deep_nls=deep_nls,
             device=DEVICE,
         )
         sample_start = time.perf_counter()
@@ -233,6 +235,7 @@ def infer_instance(
     fixed_steps=0,
     nls=False,
     T_nls=10,
+    deep_nls=False,
     **_unused,
 ):
     if val_n_iter < 1:
@@ -260,6 +263,7 @@ def infer_instance(
         fixed_steps=fixed_steps,
         nls=nls,
         T_nls=T_nls,
+        deep_nls=deep_nls,
         device=DEVICE,
     )
     faco_solver.seed_rng(seed + instance_idx)
@@ -384,6 +388,7 @@ if __name__ == '__main__':
     parser.add_argument('--smooth_mmas', action='store_true')
     parser.add_argument('--nls', action='store_true')
     parser.add_argument('--T_nls', type=int, default=10)
+    parser.add_argument('--deep_nls', action='store_true')
     parser.add_argument('--threads', type=int, default=None, help='C++ backend OpenMP thread count')
     parser.add_argument('--seed', type=int, default=0)
     args = parser.parse_args()
@@ -444,4 +449,5 @@ if __name__ == '__main__':
         smooth_mmas=args.smooth_mmas,
         nls=args.nls,
         T_nls=args.T_nls,
+        deep_nls=args.deep_nls,
     )

@@ -212,6 +212,7 @@ public:
   bool smooth_mmas;
   bool disable_heuristic;
   bool nls;
+  bool deep_nls;
   int32_t T_nls; // number of NLS iterations (default 10)
 
   // Inter-route LS move selection flags (for ablation study)
@@ -293,7 +294,8 @@ public:
              float alpha_, float p_best_, bool use_local_search_,
              bool disable_heuristic_, bool extend_ls_ = false,
              bool smooth_mmas_ = false, int32_t fixed_steps_ = 0,
-             bool nls_ = false, int32_t T_nls_ = 10);
+             bool nls_ = false, int32_t T_nls_ = 10,
+             bool deep_nls_ = false);
 
   void seed_rng(uint64_t seed);
 
@@ -394,6 +396,15 @@ private:
   float intra_route_oropt(std::vector<int32_t> &route,
                           std::vector<int32_t> &checklist,
                           int32_t segment_len);
+
+  bool run_local_search_pipeline(std::vector<int32_t> &route,
+                                 std::vector<int32_t> &checklist,
+                                 std::vector<uint8_t> &in_checklist,
+                                 bool allow_deep_ls);
+  void run_neural_local_search(std::vector<int32_t> &route,
+                               std::vector<int32_t> &checklist,
+                               std::vector<uint8_t> &in_checklist,
+                               const float *prior_ptr, int32_t iter_idx, bool enable_nls);
 
   float inter_route_ls_optimized(std::vector<int32_t> &perm,
                                  std::vector<int32_t> &positions,

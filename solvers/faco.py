@@ -92,6 +92,7 @@ class MFACO_CVRP:
         fixed_steps: int = 0,
         nls: bool = False,
         T_nls: int = 10,
+        deep_nls: bool = False,
         use_fts_checks: bool = True,
         granular_mode: int = 0,
         granular_wait_weight: float = 0.2,
@@ -135,6 +136,7 @@ class MFACO_CVRP:
             int(fixed_steps),
             bool(nls),
             int(T_nls),
+            bool(deep_nls),
         )
         self.device = device
         self._enable_torch_sync = enable_torch_sync
@@ -286,6 +288,7 @@ class MFACO_CVRPTW(MFACO_CVRP):
         fixed_steps: int = 0,
         nls: bool = False,
         T_nls: int = 10,
+        deep_nls: bool = False,
         use_fts_checks: bool = True,
         granular_mode: int = 0,
         granular_wait_weight: float = 0.2,
@@ -335,6 +338,7 @@ class MFACO_CVRPTW(MFACO_CVRP):
             int(fixed_steps),
             bool(nls),
             int(T_nls),
+            bool(deep_nls),
             int(granular_mode),
             float(granular_wait_weight),
             float(granular_time_warp_weight),

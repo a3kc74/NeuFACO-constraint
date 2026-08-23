@@ -171,6 +171,7 @@ def infer_instance(
     fixed_steps: int,
     nls: bool,
     T_nls: int,
+    deep_nls: bool = False,
     elite_k: int = 8,
     elite_min_diversity: float = 0.15,
     elite_cost_tolerance: float = 1.05,
@@ -201,6 +202,7 @@ def infer_instance(
         fixed_steps=fixed_steps,
         nls=nls,
         T_nls=T_nls,
+        deep_nls=deep_nls,
     )
     solver.seed_rng(seed)
 
@@ -351,6 +353,7 @@ def main(
     fixed_steps: int = 0,
     nls: bool = False,
     T_nls: int = 10,
+    deep_nls: bool = False,
     elite_k: int = 8,
     elite_min_diversity: float = 0.15,
     elite_cost_tolerance: float = 1.05,
@@ -409,6 +412,7 @@ def main(
         fixed_steps=fixed_steps,
         nls=nls,
         T_nls=T_nls,
+        deep_nls=deep_nls,
         elite_k=elite_k,
         elite_min_diversity=elite_min_diversity,
         elite_cost_tolerance=elite_cost_tolerance,
@@ -476,6 +480,7 @@ def parse_args():
     parser.add_argument("--fixed_steps", type=int, default=0, help="Fixed sampler steps; 0 means default")
     parser.add_argument("--nls", action="store_true", help="Enable NLS mode")
     parser.add_argument("--T_nls", type=int, default=10, help="Number of NLS iterations")
+    parser.add_argument("--deep_nls", action="store_true", help="Enable deep LS inside NLS phase")
     parser.add_argument("--elite_k", type=int, default=8, help="Number of quality-diverse elite source routes")
     parser.add_argument("--elite_min_diversity", type=float, default=0.15, help="Minimum edge distance between elite source routes")
     parser.add_argument("--elite_cost_tolerance", type=float, default=1.05, help="Maximum elite source cost ratio versus current best")
@@ -511,6 +516,7 @@ if __name__ == "__main__":
         fixed_steps=args.fixed_steps,
         nls=args.nls,
         T_nls=args.T_nls,
+        deep_nls=args.deep_nls,
         elite_k=args.elite_k,
         elite_min_diversity=args.elite_min_diversity,
         elite_cost_tolerance=args.elite_cost_tolerance,

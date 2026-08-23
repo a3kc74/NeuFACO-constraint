@@ -213,6 +213,29 @@ def test_cvrptw_rejects_invalid_prior_shape():
     with pytest.raises(RuntimeError, match="prior must be shape"):
         solver.sample(prior=np.ones((solver.n, solver.k + 1), dtype=np.float32))
 
+def test_cvrptw_nls_deep_flag_runs_feasible_solution():
+    coords, demand, windows, capacity = gfacs_instance(20)
+    for deep_nls in (False, True):
+        solver = MFACO_CVRPTW(
+            coords,
+            demand,
+            windows,
+            capacity,
+            n_ants=2,
+            use_local_search=True,
+            cand_list_size=8,
+            nls=True,
+            T_nls=1,
+            deep_nls=deep_nls,
+            hgs_deep_ls=True,
+        )
+        solver.seed_rng(31)
+        prior = np.ones((solver.n, solver.k), dtype=np.float32)
+
+        costs, routes, *_ = solver.sample(prior=prior)
+
+        assert_cvrptw_solution(coords, demand, windows, capacity, costs, routes)
+
 def test_cvrptw_soft_intra_ls_flag_runs_feasible_solution():
     coords, demand, windows, capacity = gfacs_instance(20)
     solver = MFACO_CVRPTW(

@@ -1,12 +1,13 @@
 import os
 import random
 import time
+from pathlib import Path
 
 from tqdm import tqdm
 import numpy as np
 import torch
 
-from envs.gfacs_data import gen_instance, gen_pyg_data, load_val_dataset
+from envs.gfacs_data import gen_instance, gen_pyg_data, load_test_dataset
 from evaluation import faco_test
 from models.gfacs_net import Net
 from solvers.faco import MFACO_CVRPTW, set_faco_cpp_threads
@@ -22,6 +23,7 @@ T = 5
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 USE_WANDB = False
 TAM = False
+ROOT = Path(__file__).resolve().parent.parent
 
 DEFAULT_FACO_PARAMS = {
     "log_period": 1,
@@ -38,6 +40,7 @@ DEFAULT_FACO_PARAMS = {
     "fixed_steps": 0,
     "nls": False,
     "T_nls": 10,
+    "deep_nls": False,
     "granular_mode": 0,
     "granular_wait_weight": 0.2,
     "granular_time_warp_weight": 1.0,
@@ -93,6 +96,7 @@ def faco_solver_kwargs(params: dict, n_ants: int, cand_list_size: int) -> dict:
         "fixed_steps": params["fixed_steps"],
         "nls": params["nls"],
         "T_nls": params["T_nls"],
+        "deep_nls": params["deep_nls"],
         "granular_mode": params["granular_mode"],
         "granular_wait_weight": params["granular_wait_weight"],
         "granular_time_warp_weight": params["granular_time_warp_weight"],
@@ -266,6 +270,7 @@ def infer_instance(
         fixed_steps=params["fixed_steps"],
         nls=params["nls"],
         T_nls=params["T_nls"],
+        deep_nls=params["deep_nls"],
         log_period=params["log_period"],
         granular_mode=params["granular_mode"],
         granular_wait_weight=params["granular_wait_weight"],
@@ -370,8 +375,7 @@ def train(
     optimizer = torch.optim.AdamW(net.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs, eta_min=lr * 0.1)
 
-    os.makedirs("../data/cvrptw", exist_ok=True)
-    val_list = load_val_dataset(n_nodes, k_sparse, DEVICE, TAM, vrptw=vrptw)
+    val_list = load_test_dataset(n_nodes, k_sparse, DEVICE, TAM, vrptw=vrptw, data_dir=ROOT / "data" / "cvrptw")
     val_list = val_list[:(val_size or len(val_list))]
 
     best_result = validation(val_list, n_val_ants, net, 0, steps_per_epoch, local_search_params, faco_params, k_sparse)
@@ -460,6 +464,7 @@ if __name__ == "__main__":
     parser.add_argument("--fixed_steps", type=int, default=0)
     parser.add_argument("--nls", action="store_true")
     parser.add_argument("--T_nls", type=int, default=10)
+    parser.add_argument("--deep_nls", action="store_true")
     parser.add_argument("--granular_mode", type=int, default=0)
     parser.add_argument("--granular_wait_weight", type=float, default=0.2)
     parser.add_argument("--granular_time_warp_weight", type=float, default=1.0)
@@ -535,6 +540,7 @@ if __name__ == "__main__":
         "fixed_steps": args.fixed_steps,
         "nls": args.nls,
         "T_nls": args.T_nls,
+        "deep_nls": args.deep_nls,
         "granular_mode": args.granular_mode,
         "granular_wait_weight": args.granular_wait_weight,
         "granular_time_warp_weight": args.granular_time_warp_weight,

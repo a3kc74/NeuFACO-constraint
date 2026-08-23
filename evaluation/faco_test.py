@@ -345,6 +345,7 @@ def infer_instance(
     fixed_steps: int,
     nls: bool,
     T_nls: int,
+    deep_nls: bool = False,
     log_period: int = 1,
     granular_mode: int = 0,
     granular_wait_weight: float = 0.2,
@@ -411,6 +412,7 @@ def infer_instance(
         fixed_steps=fixed_steps,
         nls=nls,
         T_nls=T_nls,
+        deep_nls=deep_nls,
         granular_mode=granular_mode,
         granular_wait_weight=granular_wait_weight,
         granular_time_warp_weight=granular_time_warp_weight,
@@ -723,6 +725,7 @@ def main(
     fixed_steps: int = 0,
     nls: bool = False,
     T_nls: int = 10,
+    deep_nls: bool = False,
     granular_mode: int = 0,
     granular_wait_weight: float = 0.2,
     granular_time_warp_weight: float = 1.0,
@@ -909,6 +912,7 @@ def main(
         fixed_steps=fixed_steps,
         nls=nls,
         T_nls=T_nls,
+        deep_nls=deep_nls,
         granular_mode=granular_mode,
         granular_wait_weight=granular_wait_weight,
         granular_time_warp_weight=granular_time_warp_weight,
@@ -1047,6 +1051,7 @@ def parse_args():
     parser.add_argument("--fixed_steps", type=int, default=0, help="Fixed sampler steps; 0 means default")
     parser.add_argument("--nls", action="store_true", help="Enable NLS mode")
     parser.add_argument("--T_nls", type=int, default=10, help="Number of NLS iterations")
+    parser.add_argument("--deep_nls", action="store_true", help="Enable deep LS inside NLS phase")
     parser.add_argument("--granular_mode", type=int, default=0, choices=[0, 1], help="FACO KNN mode: 0 euclidean, 1 spatio-temporal")
     parser.add_argument("--granular_wait_weight", type=float, default=0.2, help="Weight for minimum wait time in granular KNN")
     parser.add_argument("--granular_time_warp_weight", type=float, default=1.0, help="Weight for minimum time warp in granular KNN")
@@ -1130,6 +1135,7 @@ if __name__ == "__main__":
         fixed_steps=args.fixed_steps,
         nls=args.nls,
         T_nls=args.T_nls,
+        deep_nls=args.deep_nls,
         granular_mode=args.granular_mode,
         granular_wait_weight=args.granular_wait_weight,
         granular_time_warp_weight=args.granular_time_warp_weight,

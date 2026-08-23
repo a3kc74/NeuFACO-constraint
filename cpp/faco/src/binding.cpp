@@ -136,7 +136,8 @@ public:
                bool use_local_search = true, bool disable_heuristic = false,
 
                bool extend_ls = false, bool smooth_mmas = false,
-               int32_t fixed_steps = 0, bool nls = false, int32_t T_nls = 10) {
+               int32_t fixed_steps = 0, bool nls = false, int32_t T_nls = 10,
+               bool deep_nls = false) {
     auto cbuf = coords.request();
     if (cbuf.ndim != 2 || cbuf.shape[1] != 2) {
       throw std::runtime_error("coords must be shape (n,2)");
@@ -152,7 +153,7 @@ public:
         (const float *)cbuf.ptr, (const float *)dbuf.ptr, n, capacity, n_ants,
         cand_list_size, backup_list_size, min_new_edges, decay, alpha, p_best,
         use_local_search, disable_heuristic, extend_ls, smooth_mmas,
-        fixed_steps, nls, T_nls);
+        fixed_steps, nls, T_nls, deep_nls);
   }
 
   // properties
@@ -353,7 +354,7 @@ public:
       bool use_local_search = true, bool disable_heuristic = false,
       bool extend_ls = false, bool smooth_mmas = false,
       int32_t fixed_steps = 0, bool nls = false, int32_t T_nls = 10,
-      int32_t granular_mode = 0, float granular_wait_weight = 0.2f,
+      bool deep_nls = false, int32_t granular_mode = 0, float granular_wait_weight = 0.2f,
       float granular_time_warp_weight = 1.0f, bool hgs_soft_deep_ls = false,
       bool hgs_soft_cheap_ls = false, bool hgs_soft_intra_ls = false,
       bool hgs_deep_ls = false, int32_t hgs_deep_top_k = 0,
@@ -365,7 +366,7 @@ public:
       : PyMFACO_CVRP(coords, demand, capacity, n_ants, cand_list_size,
                      backup_list_size, min_new_edges, decay, alpha, p_best,
                      use_local_search, disable_heuristic, extend_ls,
-                     smooth_mmas, fixed_steps, nls, T_nls) {
+                     smooth_mmas, fixed_steps, nls, T_nls, deep_nls) {
     auto cbuf = coords.request();
     auto wbuf = windows.request();
     if (wbuf.ndim != 2 || wbuf.shape[0] != cbuf.shape[0] ||
@@ -439,7 +440,7 @@ PYBIND11_MODULE(faco_opt, m) {
                py::array_t<float, py::array::c_style | py::array::forcecast>,
                py::array_t<float, py::array::c_style | py::array::forcecast>,
                float, int32_t, int32_t, int32_t, int32_t, float, float, float,
-               bool, bool, bool, bool, int32_t, bool, int32_t>(),
+               bool, bool, bool, bool, int32_t, bool, int32_t, bool>(),
            py::arg("coords"), py::arg("demand"), py::arg("capacity"),
            py::arg("n_ants"), py::arg("cand_list_size") = 32,
            py::arg("backup_list_size") = 32, py::arg("min_new_edges") = 8,
@@ -447,7 +448,8 @@ PYBIND11_MODULE(faco_opt, m) {
            py::arg("p_best") = 0.05f, py::arg("use_local_search") = true,
            py::arg("disable_heuristic") = false, py::arg("extend_ls") = false,
            py::arg("smooth_mmas") = false, py::arg("fixed_steps") = 0,
-           py::arg("nls") = false, py::arg("T_nls") = 10)
+           py::arg("nls") = false, py::arg("T_nls") = 10,
+           py::arg("deep_nls") = false)
       .def_property_readonly("n", &PyMFACO_CVRP::get_n)
       .def_property_readonly("m", &PyMFACO_CVRP::get_m)
       .def_property_readonly("n_ants", &PyMFACO_CVRP::get_n_ants)
@@ -499,7 +501,7 @@ PYBIND11_MODULE(faco_opt, m) {
                py::array_t<float, py::array::c_style | py::array::forcecast>,
                py::array_t<float, py::array::c_style | py::array::forcecast>,
                float, int32_t, int32_t, int32_t, int32_t, float, float, float,
-               bool, bool, bool, bool, int32_t, bool, int32_t, int32_t, float,
+               bool, bool, bool, bool, int32_t, bool, int32_t, bool, int32_t, float,
                float, bool, bool, bool, bool, int32_t, float, float, bool, float, int32_t, bool, int32_t>(),
            py::arg("coords"), py::arg("demand"), py::arg("windows"),
            py::arg("capacity"), py::arg("n_ants"),
@@ -510,7 +512,8 @@ PYBIND11_MODULE(faco_opt, m) {
            py::arg("disable_heuristic") = false,
            py::arg("extend_ls") = false, py::arg("smooth_mmas") = false,
            py::arg("fixed_steps") = 0, py::arg("nls") = false,
-           py::arg("T_nls") = 10, py::arg("granular_mode") = 0,
+           py::arg("T_nls") = 10, py::arg("deep_nls") = false,
+           py::arg("granular_mode") = 0,
            py::arg("granular_wait_weight") = 0.2f,
            py::arg("granular_time_warp_weight") = 1.0f,
            py::arg("hgs_soft_deep_ls") = false,

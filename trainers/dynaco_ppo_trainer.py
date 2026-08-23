@@ -156,6 +156,7 @@ def solver_kwargs(args: argparse.Namespace, n_ants: int, cand_list_size: int) ->
         'fixed_steps': args.fixed_steps,
         'nls': args.nls,
         'T_nls': args.T_nls,
+        'deep_nls': args.deep_nls,
         'device': DEVICE,
     }
 
@@ -457,6 +458,7 @@ def infer_validation_instance(model, pyg_data, instance, n_ants: int, mode: str,
         fixed_steps=kwargs['fixed_steps'],
         nls=kwargs['nls'],
         T_nls=kwargs['T_nls'],
+        deep_nls=kwargs['deep_nls'],
         prior=prior,
     )
     if mode == 'faco_test':
@@ -480,6 +482,7 @@ def infer_validation_instance(model, pyg_data, instance, n_ants: int, mode: str,
             fixed_steps=kwargs['fixed_steps'],
             nls=kwargs['nls'],
             T_nls=kwargs['T_nls'],
+            deep_nls=kwargs['deep_nls'],
         )
         solver.seed_rng(kwargs.get('seed', 0) + instance_idx)
         results = torch.zeros(size=(kwargs['val_n_iter'],), dtype=torch.float32)
@@ -789,6 +792,7 @@ def parse_args():
     parser.add_argument('--nls', action='store_true')
     parser.add_argument('--nls_beta', type=float, default=0.2)
     parser.add_argument('--T_nls', type=int, default=10)
+    parser.add_argument('--deep_nls', action='store_true')
     parser.add_argument('--elite_k', type=int, default=8)
     parser.add_argument('--elite_min_diversity', type=float, default=0.15)
     parser.add_argument('--elite_cost_tolerance', type=float, default=1.05)
