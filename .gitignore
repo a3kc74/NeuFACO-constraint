@@ -7,7 +7,6 @@ data/
 wandb/
 lkh/
 pyvrp/
-pretrained/
 concorde/
 .tmp/
 **/.pytest_cache/
