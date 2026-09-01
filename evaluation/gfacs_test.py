@@ -25,6 +25,7 @@ ACOALG = "AS"
 
 @torch.no_grad()
 def infer_instance(
+
     model,
     pyg_data,
     demands,

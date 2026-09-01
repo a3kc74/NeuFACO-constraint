@@ -46,6 +46,7 @@ def train_instance(
         beta=100.0,
         it=0,
         local_search_params=None,
+        deepaco_loss=False,
     ):
     model.train()
 
@@ -64,11 +65,16 @@ def train_instance(
     count = 0
 
     for pyg_data, demands, distances, positions, windows in data:
-        heu_vec, logZ = model(pyg_data, return_logZ=True)
-        heu_mat = model.reshape(pyg_data, heu_vec) + EPS
-        if guided_exploration:
-            logZ, logZ_ls = logZ
+        if deepaco_loss:
+            heu_vec = model(pyg_data)
+            logZ = None
+            logZ_ls = None
         else:
+            heu_vec, logZ = model(pyg_data, return_logZ=True)
+        heu_mat = model.reshape(pyg_data, heu_vec) + EPS
+        if not deepaco_loss and guided_exploration:
+            logZ, logZ_ls = logZ
+        elif not deepaco_loss:
             logZ = logZ[0]
 
         aco = ACO(
@@ -84,66 +90,92 @@ def train_instance(
         )
 
         costs, log_probs, paths = aco.sample(invtemp=invtemp)
-        baseline = costs.mean() if shared_energy_norm else torch.tensor(0.0, device=DEVICE)
-        advantages = costs - baseline
-
-        if guided_exploration:
+        if deepaco_loss:
             paths_ls = aco.local_search(paths, inference=False)
             costs_ls = aco.gen_path_costs(paths_ls)
-            baseline_ls = costs_ls.mean() if shared_energy_norm else torch.tensor(0.0, device=DEVICE)
-            advantages_ls = costs_ls - baseline_ls
+
+            advantages = costs - costs.mean()
+            advantages_ls = costs_ls - costs_ls.mean()
             weighted_advantages = cost_w * advantages_ls + (1 - cost_w) * advantages
-        else:
-            weighted_advantages = advantages
 
-        ##################################################
-        # Loss from paths before local search
-        forward_flow = log_probs.sum(0) + logZ.expand(n_ants)
-        backward_flow = calculate_log_pb_uniform(paths.T) - weighted_advantages.detach() * beta
-        tb_loss = torch.pow(forward_flow - backward_flow, 2).mean()
-        sum_loss += tb_loss
+            pg_loss = (weighted_advantages.detach() * log_probs.sum(0)).mean()
+            sum_loss += pg_loss
 
-        ##################################################
-        # Loss from paths after local search
-        if guided_exploration:
-            n_ants_ls = n_ants
             _, log_probs_ls, feasible_idx = aco.gen_path(  # type: ignore
                 require_prob=True,
-                invtemp=1.0,  # invtemp is 1.0 here, otherwise gradients from offpolicy data will be overestimated
+                invtemp=1.0,
                 paths=paths_ls,
             )
             if len(feasible_idx) < n_ants:  # type: ignore
-                paths_ls = paths_ls[:, feasible_idx]
-                costs_ls = costs_ls[feasible_idx]
                 advantages_ls = advantages_ls[feasible_idx]
-                n_ants_ls = len(feasible_idx)  # type: ignore
 
-            forward_flow_ls = log_probs_ls.sum(0) + logZ_ls.expand(n_ants_ls)
-            backward_flow_ls = calculate_log_pb_uniform(paths_ls.T) - advantages_ls.detach() * beta
-            tb_loss_ls = torch.pow(forward_flow_ls - backward_flow_ls, 2).mean()
-            sum_loss_ls += tb_loss_ls
+            pg_loss_ls = (advantages_ls.detach() * log_probs_ls.sum(0)).mean()
+            sum_loss_ls += pg_loss_ls
+        else:
+            baseline = costs.mean() if shared_energy_norm else torch.tensor(0.0, device=DEVICE)
+            advantages = costs - baseline
+
+            if guided_exploration:
+                paths_ls = aco.local_search(paths, inference=False)
+                costs_ls = aco.gen_path_costs(paths_ls)
+                baseline_ls = costs_ls.mean() if shared_energy_norm else torch.tensor(0.0, device=DEVICE)
+                advantages_ls = costs_ls - baseline_ls
+                weighted_advantages = cost_w * advantages_ls + (1 - cost_w) * advantages
+            else:
+                weighted_advantages = advantages
+
+            ##################################################
+            # Loss from paths before local search
+            forward_flow = log_probs.sum(0) + logZ.expand(n_ants)
+            backward_flow = calculate_log_pb_uniform(paths.T) - weighted_advantages.detach() * beta
+            tb_loss = torch.pow(forward_flow - backward_flow, 2).mean()
+            sum_loss += tb_loss
+
+            ##################################################
+            # Loss from paths after local search
+            if guided_exploration:
+                n_ants_ls = n_ants
+                _, log_probs_ls, feasible_idx = aco.gen_path(  # type: ignore
+                    require_prob=True,
+                    invtemp=1.0,  # invtemp is 1.0 here, otherwise gradients from offpolicy data will be overestimated
+                    paths=paths_ls,
+                )
+                if len(feasible_idx) < n_ants:  # type: ignore
+                    paths_ls = paths_ls[:, feasible_idx]
+                    costs_ls = costs_ls[feasible_idx]
+                    advantages_ls = advantages_ls[feasible_idx]
+                    n_ants_ls = len(feasible_idx)  # type: ignore
+
+                forward_flow_ls = log_probs_ls.sum(0) + logZ_ls.expand(n_ants_ls)
+                backward_flow_ls = calculate_log_pb_uniform(paths_ls.T) - advantages_ls.detach() * beta
+                tb_loss_ls = torch.pow(forward_flow_ls - backward_flow_ls, 2).mean()
+                sum_loss_ls += tb_loss_ls
 
         count += 1
 
         ##################################################
         # wandb
         if USE_WANDB:
-            _train_mean_cost += baseline.item()
+            _train_mean_cost += costs.mean().item() if deepaco_loss else baseline.item()
             _train_min_cost += costs.min().item()
 
             normed_heumat = heu_mat / heu_mat.sum(dim=1, keepdim=True)
             entropy = -(normed_heumat * torch.log(normed_heumat)).sum(dim=1).mean()
             _train_entropy += entropy.item()
 
-            _logZ_mean += logZ
-            if guided_exploration:
+            if deepaco_loss:
+                _train_mean_cost_ls += costs_ls.mean().item()
+                _train_min_cost_ls += costs_ls.min().item()
+            else:
+                _logZ_mean += logZ
+            if not deepaco_loss and guided_exploration:
                 _train_mean_cost_ls += costs_ls.mean().item()
                 _train_min_cost_ls += costs_ls.min().item()
                 _logZ_ls_mean += logZ_ls
         ##################################################
 
     sum_loss = sum_loss / count
-    sum_loss_ls = sum_loss_ls / count if guided_exploration else torch.tensor(0.0, device=DEVICE)
+    sum_loss_ls = sum_loss_ls / count if (guided_exploration or deepaco_loss) else torch.tensor(0.0, device=DEVICE)
     loss = sum_loss + sum_loss_ls
 
     optimizer.zero_grad()
@@ -165,9 +197,10 @@ def train_instance(
                 "train_loss_ls": sum_loss_ls.item(),
                 "cost_w": cost_w,
                 "invtemp": invtemp,
-                "logZ": _logZ_mean.item() / count,
-                "logZ_ls": _logZ_ls_mean.item() / count,
+                "logZ": 0.0 if deepaco_loss else _logZ_mean.item() / count,
+                "logZ_ls": 0.0 if deepaco_loss else _logZ_ls_mean.item() / count,
                 "beta": beta,
+                "deepaco_loss": deepaco_loss,
             },
             step=it,
         )
@@ -222,12 +255,13 @@ def train_epoch(
     beta=100.0,
     local_search_params=None,
     vrptw=False,
+    deepaco_loss=False,
 ):
     for i in tqdm(range(steps_per_epoch), desc="Train", dynamic_ncols=True):
         it = (epoch - 1) * steps_per_epoch + i
         data = generate_traindata(batch_size, n_node, k_sparse, vrptw=vrptw)
         train_instance(
-            net, optimizer, data, n_ants, cost_w, invtemp, guided_exploration, shared_energy_norm, beta, it, local_search_params
+            net, optimizer, data, n_ants, cost_w, invtemp, guided_exploration, shared_energy_norm, beta, it, local_search_params, deepaco_loss
         )
 
 
@@ -280,11 +314,12 @@ def train(
         beta_schedule_params=(50, 500, 5),  # (beta_min, beta_max, beta_flat_epochs)
         local_search_params=None,
         vrptw=False,
+        deepaco_loss=False,
     ):
     savepath = os.path.join(savepath, str(n_nodes), run_name)
     os.makedirs(savepath, exist_ok=True)
 
-    net = Net(gfn=True, Z_out_dim=2 if guided_exploration else 1).to(DEVICE)
+    net = Net(gfn=not deepaco_loss, Z_out_dim=2 if guided_exploration else 1).to(DEVICE)
     if pretrained:
         net.load_state_dict(torch.load(pretrained, map_location=DEVICE))
     optimizer = torch.optim.AdamW(net.parameters(), lr=lr)
@@ -326,6 +361,7 @@ def train(
             beta,
             local_search_params,
             vrptw,
+            deepaco_loss,
         )
         sum_time += time.time() - start
 
@@ -369,6 +405,7 @@ if __name__ == "__main__":
     parser.add_argument("--invtemp_max", type=float, default=1.0, help='Inverse temperature max for GFACS')
     parser.add_argument("--invtemp_flat_epochs", type=int, default=5, help='Inverse temperature flat epochs for GFACS')
     ### GFACS
+    parser.add_argument("--deepaco_loss", action='store_true', help='Use DeepACO-style policy gradient loss instead of GFACS trajectory balance loss')
     parser.add_argument("--disable_guided_exp", action='store_true', help='Disable guided exploration for GFACS')
     parser.add_argument("--disable_shared_energy_norm", action='store_true', help='Disable shared energy normalization for GFACS')
     parser.add_argument("--beta_min", type=float, default=None, help='Beta min for GFACS')
@@ -438,7 +475,7 @@ if __name__ == "__main__":
         "max_trials": args.max_trials,
         "neighbourhood_params": {"nb_granular": args.nb_granular},
         "cost_evaluator_params": {"load_penalty": args.load_penalty, "tw_penalty": args.tw_penalty},
-    } if not args.disable_guided_exp else None
+    } if (not args.disable_guided_exp or args.deepaco_loss) else None
 
     train(
         args.nodes,
@@ -461,4 +498,5 @@ if __name__ == "__main__":
         beta_schedule_params=(args.beta_min, args.beta_max, args.beta_flat_epochs),
         local_search_params=local_search_params,
         vrptw=args.vrptw,
+        deepaco_loss=args.deepaco_loss,
     )

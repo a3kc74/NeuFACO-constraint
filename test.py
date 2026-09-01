@@ -1,4 +1,4 @@
-﻿"""Unified evaluation entry point for NeuFACO constraint experiments."""
+"""Unified evaluation entry point for NeuFACO constraint experiments."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ METHOD_TO_SCRIPT = {
     "faco_ib": ROOT / "evaluation" / "faco_test_ib.py",
     "gfacs": ROOT / "evaluation" / "gfacs_test.py",
     "macs": ROOT / "baselines" / "macs_baseline.py",
+    "pyvrp": ROOT / "baselines" / "pyvrp_baseline.py",
 }
 
 
@@ -47,3 +48,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
